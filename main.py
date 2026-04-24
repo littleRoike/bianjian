@@ -11,6 +11,9 @@ import json
 import base64
 import shutil
 import threading
+import time
+import ctypes
+from ctypes import wintypes
 from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, colorchooser, filedialog, messagebox
@@ -25,7 +28,7 @@ except Exception:
 
 # Pillow 图像 → Tk 位图（用于悬浮球）。与托盘不同，未装 PIL 时悬浮球降级为纯画布。
 try:
-    from PIL import Image as _PILImage, ImageTk as _PILImageTk
+    from PIL import Image as _PILImage
     _HAS_PIL_TK = True
 except Exception:
     _HAS_PIL_TK = False
@@ -222,7 +225,139 @@ APP_PREFS_PATH = os.path.join(get_data_dir(), "app.json")
 
 # 悬浮球图标路径（打包时通过 --add-data 带上 static 目录）
 BALL_IMAGE_PATH = resource_path(os.path.join("static", "便笺.png"))
-BALL_SIZE = 48
+BALL_SIZE = 40
+BALL_PEEK = 16
+BALL_AUTO_HIDE_MS = 3000
+BALL_EDGE_TOLERANCE = 3
+
+# Win32 layered window constants (Windows only)
+GWL_EXSTYLE = -20
+WS_EX_LAYERED = 0x00080000
+ULW_ALPHA = 0x00000002
+AC_SRC_OVER = 0x00
+AC_SRC_ALPHA = 0x01
+BI_RGB = 0
+DIB_RGB_COLORS = 0
+
+
+class _POINT(ctypes.Structure):
+    _fields_ = [("x", wintypes.LONG), ("y", wintypes.LONG)]
+
+
+class _SIZE(ctypes.Structure):
+    _fields_ = [("cx", wintypes.LONG), ("cy", wintypes.LONG)]
+
+
+class _BLENDFUNCTION(ctypes.Structure):
+    _fields_ = [
+        ("BlendOp", ctypes.c_ubyte),
+        ("BlendFlags", ctypes.c_ubyte),
+        ("SourceConstantAlpha", ctypes.c_ubyte),
+        ("AlphaFormat", ctypes.c_ubyte),
+    ]
+
+
+class _BITMAPINFOHEADER(ctypes.Structure):
+    _fields_ = [
+        ("biSize", wintypes.DWORD),
+        ("biWidth", wintypes.LONG),
+        ("biHeight", wintypes.LONG),
+        ("biPlanes", wintypes.WORD),
+        ("biBitCount", wintypes.WORD),
+        ("biCompression", wintypes.DWORD),
+        ("biSizeImage", wintypes.DWORD),
+        ("biXPelsPerMeter", wintypes.LONG),
+        ("biYPelsPerMeter", wintypes.LONG),
+        ("biClrUsed", wintypes.DWORD),
+        ("biClrImportant", wintypes.DWORD),
+    ]
+
+
+class _BITMAPINFO(ctypes.Structure):
+    _fields_ = [("bmiHeader", _BITMAPINFOHEADER), ("bmiColors", wintypes.DWORD * 3)]
+
+
+def _rgba_to_premultiplied_bgra_bytes(img):
+    rgba = img.convert("RGBA").tobytes()
+    src = memoryview(rgba)
+    out = bytearray(len(rgba))
+    for i in range(0, len(src), 4):
+        r = src[i]
+        g = src[i + 1]
+        b = src[i + 2]
+        a = src[i + 3]
+        out[i] = (b * a) // 255
+        out[i + 1] = (g * a) // 255
+        out[i + 2] = (r * a) // 255
+        out[i + 3] = a
+    return bytes(out)
+
+
+def _update_layered_window_rgba(hwnd, pil_img, x, y):
+    """Windows per-pixel alpha 绘制。失败抛异常由调用方兜底。"""
+    user32 = ctypes.windll.user32
+    gdi32 = ctypes.windll.gdi32
+
+    w, h = pil_img.size
+    bgra = _rgba_to_premultiplied_bgra_bytes(pil_img)
+
+    style = user32.GetWindowLongW(hwnd, GWL_EXSTYLE)
+    if not (style & WS_EX_LAYERED):
+        user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style | WS_EX_LAYERED)
+
+    bmi = _BITMAPINFO()
+    bmi.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    bmi.bmiHeader.biWidth = w
+    bmi.bmiHeader.biHeight = -h  # top-down DIB
+    bmi.bmiHeader.biPlanes = 1
+    bmi.bmiHeader.biBitCount = 32
+    bmi.bmiHeader.biCompression = BI_RGB
+    bmi.bmiHeader.biSizeImage = w * h * 4
+
+    bits = ctypes.c_void_p()
+    hdc_screen = user32.GetDC(None)
+    if not hdc_screen:
+        raise RuntimeError("GetDC failed")
+    hdc_mem = gdi32.CreateCompatibleDC(hdc_screen)
+    if not hdc_mem:
+        user32.ReleaseDC(None, hdc_screen)
+        raise RuntimeError("CreateCompatibleDC failed")
+
+    hbitmap = gdi32.CreateDIBSection(
+        hdc_mem, ctypes.byref(bmi), DIB_RGB_COLORS, ctypes.byref(bits), None, 0
+    )
+    if not hbitmap or not bits:
+        gdi32.DeleteDC(hdc_mem)
+        user32.ReleaseDC(None, hdc_screen)
+        raise RuntimeError("CreateDIBSection failed")
+
+    old_obj = gdi32.SelectObject(hdc_mem, hbitmap)
+    ctypes.memmove(bits, bgra, len(bgra))
+
+    pt_dst = _POINT(int(x), int(y))
+    size = _SIZE(int(w), int(h))
+    pt_src = _POINT(0, 0)
+    blend = _BLENDFUNCTION(AC_SRC_OVER, 0, 255, AC_SRC_ALPHA)
+
+    ok = user32.UpdateLayeredWindow(
+        hwnd,
+        hdc_screen,
+        ctypes.byref(pt_dst),
+        ctypes.byref(size),
+        hdc_mem,
+        ctypes.byref(pt_src),
+        0,
+        ctypes.byref(blend),
+        ULW_ALPHA,
+    )
+
+    gdi32.SelectObject(hdc_mem, old_obj)
+    gdi32.DeleteObject(hbitmap)
+    gdi32.DeleteDC(hdc_mem)
+    user32.ReleaseDC(None, hdc_screen)
+
+    if not ok:
+        raise RuntimeError("UpdateLayeredWindow failed")
 
 
 def new_note_id() -> str:
@@ -250,6 +385,7 @@ class FlatMenu:
         self.min_width = min_width
         self.items = []  # [("cmd", label, cmd, shortcut) | ("sep", None, None, None)]
         self._win = None
+        self._last_close_at = 0.0
 
     def add_command(self, label, command, shortcut="", dot_color=None):
         self.items.append(("cmd", label, command, shortcut, dot_color))
@@ -269,6 +405,7 @@ class FlatMenu:
             except Exception:
                 pass
             self._win = None
+        self._last_close_at = time.monotonic()
 
     def popup(self, x, y):
         self.close()
@@ -577,6 +714,7 @@ class StickyNote:
         self._reordering = False
         self._click_lock = False
         self._press_info = None
+        self._select_all_active = False
         self._minimize_pending_restore = False
         self._hide_state = "visible"
         self._hide_edge = None
@@ -591,8 +729,8 @@ class StickyNote:
         # 定时检查贴边
         self._schedule_edge_check()
 
-        # 窗口关闭协议：×按钮 → 隐藏到托盘（由 app 统一管理）
-        self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
+        # 窗口关闭协议：按用户设置执行“隐藏到托盘 / 退出程序”
+        self.root.protocol("WM_DELETE_WINDOW", self.request_close)
 
         # 新便笺：立刻落盘一次，确保文件存在
         if is_new:
@@ -678,6 +816,9 @@ class StickyNote:
         self.top_bar.pack(fill="x", side="top")
         self.top_bar.pack_propagate(False)
 
+        # 重要：pack 顺序决定空间分配——必须先 pack 左/右按钮组（固定宽度），
+        # 再 pack 中间标题（expand=True 占剩余）。否则标题会把右侧按钮挤出窗口外，
+        # 出现"关闭按钮不见了"的 bug。
         left = tk.Frame(self.top_bar, bg=COLOR_TOP_BG)
         left.pack(side="left", padx=6)
         self._icon_btn(left, "\u002B", self.app.new_note,
@@ -687,7 +828,23 @@ class StickyNote:
                        tip="更多", size=18,
                        bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
 
-        # 中间：便笺标题（点击可编辑）
+        right = tk.Frame(self.top_bar, bg=COLOR_TOP_BG)
+        right.pack(side="right", padx=6)
+        self.pin_btn = self._icon_btn(
+            right, self._pin_icon(), self.toggle_pin, tip="置顶", size=13,
+            bg_override=COLOR_TOP_BG,
+        )
+        self.pin_btn.pack(side="left", padx=1)
+        self._icon_btn(right, "\u2013", self.minimize_window,
+                       tip="最小化为悬浮球（右侧）", size=14,
+                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
+        self._icon_btn(right, "\u2715", self.request_close,
+                       tip="隐藏到托盘 (右下角角标)",
+                       size=14, hover=COLOR_BTN_HOVER,
+                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
+
+        # 中间：便笺标题（双击可编辑，单击拖动窗口）。
+        # 放最后 pack，只占 left/right 之外的剩余空间。
         self.title_frame = tk.Frame(self.top_bar, bg=COLOR_TOP_BG)
         self.title_frame.pack(side="left", fill="x", expand=True, padx=2)
         self.title_label = tk.Label(
@@ -699,27 +856,13 @@ class StickyNote:
             cursor="hand2",
             anchor="center",
         )
-        self.title_label.pack(fill="x", expand=True)
-        self.title_label.bind("<Button-1>", self._begin_edit_title)
+        # width=0 + fill="x"：跟随父容器宽度；父容器宽度受 left/right 占位约束，
+        # 文本过长时由 Tk 自动截断绘制，不会反向撑开父 frame 挤掉右侧按钮。
+        self.title_label.pack(fill="x")
+        self.title_label.bind("<ButtonPress-1>", self._start_move)
+        self.title_label.bind("<B1-Motion>", self._do_move)
         self.title_label.bind("<Double-Button-1>", self._begin_edit_title)
-        # 拖动：非标题也要能拖动窗口（标题本身点击是编辑，用右键拖动稍复杂；
-        # 保持标题区域不拖动，top_bar 其它区域拖动）
         self.title_entry = None  # lazy-create
-
-        right = tk.Frame(self.top_bar, bg=COLOR_TOP_BG)
-        right.pack(side="right", padx=6)
-        self.pin_btn = self._icon_btn(
-            right, self._pin_icon(), self.toggle_pin, tip="置顶", size=13,
-            bg_override=COLOR_TOP_BG,
-        )
-        self.pin_btn.pack(side="left", padx=1)
-        self._icon_btn(right, "\u2013", self.minimize_window,
-                       tip="最小化为悬浮球", size=14,
-                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
-        self._icon_btn(right, "\u2715", self.hide_to_tray,
-                       tip="隐藏到托盘 (右下角角标)",
-                       size=14, hover=COLOR_BTN_HOVER,
-                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
 
         # 顶栏（除标题区）用作拖动
         for w in (self.top_bar, left, right):
@@ -859,10 +1002,12 @@ class StickyNote:
         # "更多" 菜单（自定义扁平风格）—— 所有偏好设置都直接展开
         self.more_menu = FlatMenu(self.root, min_width=240)
         self.more_menu.add_command("新建便笺", self.app.new_note)
+        self.more_menu.add_command("打开便笺\u2026", lambda: self.app.show_note_picker(self.root))
         self.more_menu.add_command("新建任务", self.new_task_top)
         self.more_menu.add_command("切换任务 / 增删复选框", self.toggle_task_lines, "Ctrl+L")
         self.more_menu.add_separator()
         self.more_menu.add_command("切换置顶", self.toggle_pin)
+        self.more_menu.add_command("窗口尺寸\u2026", self.show_size_dialog)
         self.more_menu.add_command("透明度调节\u2026", self.show_transparency_dialog)
         self.more_menu.add_command("高亮颜色\u2026", self.choose_highlight_color)
         self.more_menu.add_command("主题颜色\u2026", self.show_theme_dialog)
@@ -873,6 +1018,7 @@ class StickyNote:
         self.more_menu.add_separator()
         self.more_menu.add_command("最小化", self.minimize_window)
         self.more_menu.add_command("隐藏到托盘", self.hide_to_tray)
+        self.more_menu.add_command("关闭模式…", self.show_close_mode_dialog)
         self.more_menu.add_command("删除此便笺", self.delete_this_note)
         self.more_menu.add_command("关于", self.show_about)
         self.more_menu.add_command("退出程序", self.real_quit)
@@ -947,6 +1093,14 @@ class StickyNote:
         self.text.bind("<ButtonRelease-1>", self._on_text_release)
         # Home 键：让光标落在复选框之后（任务行）
         self.text.bind("<Home>", self._on_home)
+        # 左右方向键后纠正光标：任务行不允许落在 checkbox 左侧/内部
+        self.text.bind("<Left>", self._on_left_right, add="+")
+        self.text.bind("<Right>", self._on_left_right, add="+")
+        # 上下方向键后纠正光标（仅普通移动；Shift+上下扩选不介入）
+        self.text.bind("<Up>", self._on_up_down, add="+")
+        self.text.bind("<Down>", self._on_up_down, add="+")
+        # 顶部边界：抑制 Shift+Up 重复触发导致的选区闪烁
+        self.text.bind("<Shift-Up>", self._on_shift_up, add="+")
         # 拖选 / 键盘扩展选区之后：自动修正选区，跳过复选框
         self.text.bind("<<Selection>>", self._on_selection_changed)
         # 复制 / 剪切：过滤掉选区里的复选框前缀
@@ -1223,15 +1377,82 @@ class StickyNote:
         return None
 
     def _on_home(self, event):
-        """Home：任务行落到 prefix 之后，普通行落到行首。"""
+        """Home：任务行落到 prefix 之后；Shift+Home 扩展选区。"""
         idx = self.text.index("insert")
         line_no = int(idx.split(".")[0])
         is_task, _, prefix_len = self._line_prefix_info(line_no)
         target = f"{line_no}.{prefix_len if is_task else 0}"
+        # Shift+Home：保留并扩展选区（不走默认 Tk，避免任务行落到 prefix 之前）
+        if event.state & 0x0001:
+            # 仅当目标命中锚点时才折叠选区，避免连续 Shift+Home 误清空选区
+            if self._selection_exists():
+                try:
+                    sel_first = self.text.index("sel.first")
+                    sel_last = self.text.index("sel.last")
+                    anchor = self.text.index("anchor")
+                except tk.TclError:
+                    sel_first = sel_last = anchor = None
+                if sel_first and self.text.compare(target, "==", anchor):
+                    self.text.mark_set("insert", target)
+                    self.text.mark_set("anchor", target)
+                    self.text.tag_remove("sel", "1.0", "end")
+                    return "break"
+
+            if not self._selection_exists():
+                self.text.mark_set("anchor", "insert")
+            self.text.mark_set("insert", target)
+            anchor = self.text.index("anchor")
+            cur = self.text.index("insert")
+            self.text.tag_remove("sel", "1.0", "end")
+            if self.text.compare(anchor, "<", cur):
+                self.text.tag_add("sel", anchor, cur)
+            elif self.text.compare(anchor, ">", cur):
+                self.text.tag_add("sel", cur, anchor)
+            # 复用现有规则：选区自动避开 checkbox prefix
+            self._on_selection_changed()
+            return "break"
+
         self.text.mark_set("insert", target)
-        # 清除可能的选区（普通 Home 行为）
+        # 普通 Home：清除可能的选区
         self.text.tag_remove("sel", "1.0", "end")
         return "break"
+
+    def _on_left_right(self, _event):
+        """左右键后纠正插入点：任务行光标不得进入 checkbox prefix。"""
+        self.root.after_idle(self._clamp_insert_after_prefix)
+        return None
+
+    def _on_up_down(self, event):
+        """上下键后纠正插入点（含 Shift+上下扩选场景）。"""
+        self.root.after_idle(self._clamp_insert_after_prefix)
+        return None
+
+    def _on_shift_up(self, _event):
+        """到达首行前缀边界后，吞掉重复 Shift+Up，避免选区闪烁。"""
+        try:
+            idx = self.text.index("insert")
+            line_no = int(idx.split(".")[0])
+            col = int(idx.split(".")[1])
+        except Exception:
+            return None
+        if line_no != 1:
+            return None
+        is_task, _checked, prefix_len = self._line_prefix_info(1)
+        if is_task and col <= prefix_len and self._selection_exists():
+            self.text.mark_set("insert", f"1.{prefix_len}")
+            return "break"
+        return None
+
+    def _clamp_insert_after_prefix(self):
+        try:
+            idx = self.text.index("insert")
+            line_no = int(idx.split(".")[0])
+            col = int(idx.split(".")[1])
+        except Exception:
+            return
+        is_task, _checked, prefix_len = self._line_prefix_info(line_no)
+        if is_task and col < prefix_len:
+            self.text.mark_set("insert", f"{line_no}.{prefix_len}")
 
     # -------- 鼠标按下 / 拖拽 / 松开 --------
     def _on_text_press(self, event):
@@ -1343,6 +1564,35 @@ class StickyNote:
         if not content:
             self._insert_task_at_line_start(1, checked=False)
             self.text.mark_set("insert", "1.2")
+
+    def _normalize_checkbox_prefixes(self):
+        """归一化行首复选框前缀，避免出现 '☐ ☐ ' / '☑ ☐ ' 这类重复前缀。"""
+        try:
+            last_line = int(self.text.index("end-1c").split(".")[0])
+        except Exception:
+            return
+        for ln in range(1, last_line + 1):
+            line_start = f"{ln}.0"
+            line_end = f"{ln}.end"
+            content = self.text.get(line_start, line_end)
+            if not content:
+                continue
+            if content.startswith(UNCHECKED + " ") or content.startswith(CHECKED + " "):
+                head = content[:2]
+                rest = content[2:]
+                # 连续剥离多余前缀，只保留首个前缀语义
+                while rest.startswith(UNCHECKED + " ") or rest.startswith(CHECKED + " "):
+                    rest = rest[2:]
+                new_line = head + rest
+                if new_line != content:
+                    self.text.delete(line_start, line_end)
+                    self.text.insert(line_start, new_line)
+                    checked = (head[0] == CHECKED)
+                    self.text.tag_remove("checkbox", f"{ln}.0", f"{ln}.1")
+                    self.text.tag_remove("checkbox_done", f"{ln}.0", f"{ln}.1")
+                    self.text.tag_add("checkbox_done" if checked else "checkbox",
+                                      f"{ln}.0", f"{ln}.1")
+                    self._apply_done_style(ln, checked)
 
     def new_task_top(self):
         """在开头新增一个任务。"""
@@ -1490,6 +1740,19 @@ class StickyNote:
         self._save_config()
 
     def show_more_menu(self):
+        menu_win = getattr(self.more_menu, "_win", None)
+        if menu_win is not None:
+            try:
+                if menu_win.winfo_exists():
+                    self.more_menu.close()
+                    return
+            except Exception:
+                # 菜单窗口状态异常时，继续走弹出逻辑。
+                pass
+        # 点击“更多”按钮时，菜单会先 FocusOut 关闭，再触发按钮回调；
+        # 在一个很短窗口内抑制重开，避免出现“第二次点击又弹出”。
+        if (time.monotonic() - getattr(self.more_menu, "_last_close_at", 0.0)) < 0.18:
+            return
         x = self.root.winfo_rootx() + 44
         y = self.root.winfo_rooty() + 38
         self.more_menu.popup(x, y)
@@ -1573,6 +1836,101 @@ class StickyNote:
         try:
             os.makedirs(NOTES_DIR, exist_ok=True)
             os.startfile(NOTES_DIR)
+        except Exception:
+            pass
+
+    # --------------------------------------------------------
+    # 窗口尺寸（预设 + 自定义）
+    # --------------------------------------------------------
+    # 预设尺寸：(宽, 高, 标签)
+    SIZE_PRESETS = (
+        (280, 380, "紧凑"),
+        (360, 500, "标准"),
+        (440, 620, "宽松"),
+        (560, 720, "超大"),
+    )
+
+    def show_size_dialog(self):
+        dlg = FlatDialog(self.root, title="窗口尺寸", width=320)
+        tk.Label(
+            dlg.body,
+            text="选择预设尺寸，或在下方自定义宽高（像素）。",
+            bg=COLOR_BG, fg=COLOR_SUBTLE,
+            font=(FONT_FAMILY, 10), justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+
+        # 预设行
+        preset_row = tk.Frame(dlg.body, bg=COLOR_BG)
+        preset_row.pack(fill="x", pady=(0, 12))
+        for w, h, label in self.SIZE_PRESETS:
+            def apply_size(wv=w, hv=h):
+                dlg.close()
+                self.apply_window_size(wv, hv)
+            flat_button(preset_row, f"{label}\n{w}×{h}", apply_size).pack(
+                side="left", padx=(0, 6))
+
+        # 自定义
+        tk.Frame(dlg.body, bg=COLOR_MENU_SEP, height=1).pack(fill="x", pady=6)
+        form = tk.Frame(dlg.body, bg=COLOR_BG)
+        form.pack(fill="x", pady=(4, 8))
+
+        cur_w = self.root.winfo_width()
+        cur_h = self.root.winfo_height()
+        tk.Label(form, text="宽度：", bg=COLOR_BG, fg=COLOR_FG,
+                 font=(FONT_FAMILY, 10)).grid(row=0, column=0, sticky="w", padx=(0, 4), pady=3)
+        w_var = tk.StringVar(value=str(cur_w))
+        w_entry = tk.Entry(form, textvariable=w_var, bg="#ffffff", fg=COLOR_FG,
+                           relief="flat", highlightthickness=1,
+                           highlightbackground=COLOR_BORDER,
+                           highlightcolor=COLOR_BORDER, width=8)
+        w_entry.grid(row=0, column=1, sticky="w", pady=3)
+        tk.Label(form, text=f"  (最小 {MIN_W})", bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=(FONT_FAMILY, 9)).grid(row=0, column=2, sticky="w")
+
+        tk.Label(form, text="高度：", bg=COLOR_BG, fg=COLOR_FG,
+                 font=(FONT_FAMILY, 10)).grid(row=1, column=0, sticky="w", padx=(0, 4), pady=3)
+        h_var = tk.StringVar(value=str(cur_h))
+        h_entry = tk.Entry(form, textvariable=h_var, bg="#ffffff", fg=COLOR_FG,
+                           relief="flat", highlightthickness=1,
+                           highlightbackground=COLOR_BORDER,
+                           highlightcolor=COLOR_BORDER, width=8)
+        h_entry.grid(row=1, column=1, sticky="w", pady=3)
+        tk.Label(form, text=f"  (最小 {MIN_H})", bg=COLOR_BG, fg=COLOR_MUTED,
+                 font=(FONT_FAMILY, 9)).grid(row=1, column=2, sticky="w")
+
+        # 按钮
+        btn_row = tk.Frame(dlg.body, bg=COLOR_BG)
+        btn_row.pack(fill="x", pady=(10, 0))
+
+        def on_ok():
+            try:
+                ww = int(w_var.get())
+                hh = int(h_var.get())
+            except ValueError:
+                return
+            dlg.close()
+            self.apply_window_size(ww, hh)
+
+        flat_button(btn_row, "取消", dlg.close).pack(side="right", padx=(6, 0))
+        flat_button(btn_row, "应用", on_ok, primary=True).pack(side="right")
+        w_entry.bind("<Return>", lambda _e: on_ok())
+        h_entry.bind("<Return>", lambda _e: on_ok())
+
+        dlg.place_near(self.root)
+        dlg.focus_force()
+
+    def apply_window_size(self, w, h):
+        """把当前便笺调整到给定宽高。强制在 MIN 与屏幕之间夹逼。"""
+        try:
+            sw = self.root.winfo_screenwidth()
+            sh = self.root.winfo_screenheight()
+            w = max(MIN_W, min(int(w), sw))
+            h = max(MIN_H, min(int(h), sh - 40))
+            # 保持左上角不变
+            x = self.root.winfo_x()
+            y = self.root.winfo_y()
+            self.root.geometry(f"{w}x{h}+{x}+{y}")
+            self._schedule_save()
         except Exception:
             pass
 
@@ -2073,11 +2431,25 @@ class StickyNote:
             start = self.text.index("sel.first")
             end = self.text.index("sel.last")
         except tk.TclError:
+            self._select_all_active = False
             return
+
+        doc_end = self.text.index("end-1c")
+        first_is_task, _c, first_plen = self._line_prefix_info(1)
+        full_start = f"1.{first_plen if first_is_task else 0}"
+        # Ctrl+A 全选场景：保持连续选区，不做逐行重建，避免大文本卡顿。
+        if self.text.compare(start, "==", full_start) and self.text.compare(end, "==", doc_end):
+            self._select_all_active = True
+            return
+        self._select_all_active = False
 
         start_line = int(start.split(".")[0])
         start_col = int(start.split(".")[1])
         end_line = int(end.split(".")[0])
+
+        # 超大跨度选区不做逐行重建，避免 UI 偶发卡死。
+        if end_line - start_line > 1200:
+            return
 
         # 按行构造要保留的子选区，跳过每行 checkbox prefix
         segments = []
@@ -2123,7 +2495,9 @@ class StickyNote:
             is_task, _c, plen = self._line_prefix_info(1)
             start = f"1.{plen if is_task else 0}"
             self.text.tag_add("sel", start, "end-1c")
+            self.text.mark_set("anchor", start)
             self.text.mark_set("insert", "end-1c")
+            self._select_all_active = True
         finally:
             self._updating_sel = False
 
@@ -2192,6 +2566,52 @@ class StickyNote:
         except tk.TclError:
             return
 
+        # 防御：即便极端键盘时序使 start 偶发落到 prefix 左侧，也先夹紧到 prefix 后。
+        s_line = int(start.split(".")[0])
+        s_col = int(start.split(".")[1])
+        s_is_task, _s_checked, s_plen = self._line_prefix_info(s_line)
+        if s_is_task and s_col < s_plen:
+            start = f"{s_line}.{s_plen}"
+
+        # 全选（Ctrl+A）快速路径：直接清空并保留一个初始任务行。
+        # 避免大选区跨行删除导致的残留 checkbox 与偶发卡顿。
+        doc_end = self.text.index("end-1c")
+        first_is_task, _c1, first_plen = self._line_prefix_info(1)
+        full_start = f"1.{first_plen if first_is_task else 0}"
+        is_full_doc_selection = (
+            self.text.compare(start, "==", full_start)
+            and self.text.compare(end, "==", doc_end)
+        )
+        if self._select_all_active or is_full_doc_selection:
+            self._updating_sel = True
+            try:
+                self.text.delete("1.0", "end")
+                self._ensure_first_task()
+                self._normalize_checkbox_prefixes()
+                self.text.tag_remove("sel", "1.0", "end")
+            finally:
+                self._updating_sel = False
+                self._select_all_active = False
+            self._schedule_save()
+            return
+
+        sel_ranges = self.text.tag_ranges("sel")
+        # 多段选区（由 _on_selection_changed 构造）必须按分段删除；
+        # 若用 sel.first->sel.last 连续删除，会把中间被跳过的 checkbox prefix 也吞掉。
+        if len(sel_ranges) > 2:
+            insert_pos = str(sel_ranges[0])
+            for i in range(len(sel_ranges) - 2, -1, -2):
+                s = str(sel_ranges[i])
+                e = str(sel_ranges[i + 1])
+                if self.text.compare(s, "<", e):
+                    self.text.delete(s, e)
+            self._normalize_checkbox_prefixes()
+            self.text.mark_set("insert", insert_pos)
+            self.text.tag_remove("sel", "1.0", "end")
+            self._select_all_active = False
+            self._schedule_save()
+            return
+
         start_line = int(start.split(".")[0])
         start_col = int(start.split(".")[1])
         end_line = int(end.split(".")[0])
@@ -2199,7 +2619,9 @@ class StickyNote:
         if start_line == end_line:
             # 单行：选区已由 _on_selection_changed 避开 prefix
             self.text.delete(start, end)
+            self._normalize_checkbox_prefixes()
             self.text.mark_set("insert", start)
+            self._select_all_active = False
             self._schedule_save()
             return
 
@@ -2212,9 +2634,11 @@ class StickyNote:
             self.text.delete(start, end)
         except tk.TclError:
             return
+        self._normalize_checkbox_prefixes()
         self.text.mark_set("insert", start)
         # 清除选区
         self.text.tag_remove("sel", "1.0", "end")
+        self._select_all_active = False
 
         self._schedule_save()
 
@@ -2284,7 +2708,14 @@ class StickyNote:
                 pass
             self._visible = False
             try:
-                self.app.show_floating_ball(self)
+                ball = self.app.show_floating_ball(self)
+                if ball is None:
+                    # 图片不可用或悬浮球创建失败：回退传统最小化
+                    try:
+                        self.root.deiconify()
+                    except Exception:
+                        pass
+                    self._legacy_minimize()
             except Exception:
                 # 悬浮球创建失败时回退传统最小化
                 self._legacy_minimize()
@@ -2342,6 +2773,200 @@ class StickyNote:
     def hide_to_tray(self):
         """关闭按钮：把本便笺隐藏到托盘。委托给 NotesApp 决定是否真正退出。"""
         self.app.hide_note(self)
+
+    def _ask_close_mode(self, initial_mode="tray", initial_remember=False):
+        """关闭确认：选择“最小化到托盘 / 关闭程序”，可勾选永久保存。"""
+        dlg = FlatDialog(self.root, title="关闭选项", width=360)
+
+        tk.Label(
+            dlg.body,
+            text="点击关闭按钮时，你希望执行哪种操作？",
+            bg=COLOR_BG, fg=COLOR_SUBTLE,
+            font=(FONT_FAMILY, 10), justify="left",
+        ).pack(anchor="w", pady=(0, 10))
+
+        mode_var = tk.StringVar(value=initial_mode if initial_mode in ("tray", "quit") else "tray")
+        remember_var = tk.BooleanVar(value=bool(initial_remember))
+        option_bg = COLOR_BG
+        option_hover = COLOR_BTN_HOVER
+
+        tk.Frame(dlg.body, bg=COLOR_MENU_SEP, height=1).pack(fill="x", pady=(0, 8))
+
+        def _radio_row(text, value, desc):
+            row = tk.Frame(dlg.body, bg=option_bg, cursor="hand2")
+            row.pack(fill="x", pady=2)
+            icon = tk.Label(
+                row,
+                text="",
+                bg=option_bg,
+                fg=COLOR_FG,
+                font=(FONT_FAMILY, 11),
+                padx=6,
+                pady=2,
+            )
+            icon.pack(side="left", anchor="n")
+            text_wrap = tk.Frame(row, bg=option_bg)
+            text_wrap.pack(side="left", fill="x", expand=True)
+            title = tk.Label(
+                text_wrap,
+                text=text,
+                bg=option_bg,
+                fg=COLOR_FG,
+                anchor="w",
+                justify="left",
+                font=(FONT_FAMILY, 10),
+                padx=0,
+                pady=2,
+            )
+            title.pack(fill="x")
+            tip = tk.Label(
+                text_wrap,
+                text=desc,
+                bg=option_bg,
+                fg=COLOR_MUTED,
+                font=(FONT_FAMILY, 9),
+                anchor="w",
+                justify="left",
+                padx=0,
+                pady=0,
+            )
+            tip.pack(fill="x", pady=(0, 4))
+
+            def refresh_icon():
+                icon.configure(text="◉" if mode_var.get() == value else "○")
+
+            def choose(_e=None):
+                mode_var.set(value)
+                refresh_icon()
+
+            def on_enter(_e=None):
+                row.configure(bg=option_hover)
+                icon.configure(bg=option_hover)
+                text_wrap.configure(bg=option_hover)
+                title.configure(bg=option_hover)
+                tip.configure(bg=option_hover)
+
+            def on_leave(_e=None):
+                row.configure(bg=option_bg)
+                icon.configure(bg=option_bg)
+                text_wrap.configure(bg=option_bg)
+                title.configure(bg=option_bg)
+                tip.configure(bg=option_bg)
+
+            for w in (row, icon, text_wrap, title, tip):
+                w.bind("<Button-1>", choose)
+                w.bind("<Enter>", on_enter)
+                w.bind("<Leave>", on_leave)
+            mode_var.trace_add("write", lambda *_: refresh_icon())
+            refresh_icon()
+            return row
+
+        _radio_row("最小化到托盘（默认推荐）", "tray", "关闭窗口后仍常驻后台，可从右下角图标快速恢复。")
+        _radio_row("关闭程序", "quit", "退出整个便笺应用，所有窗口都会关闭。")
+
+        tk.Frame(dlg.body, bg=COLOR_MENU_SEP, height=1).pack(fill="x", pady=(8, 8))
+
+        remember_row = tk.Frame(dlg.body, bg=option_bg, cursor="hand2")
+        remember_row.pack(fill="x")
+        remember_icon = tk.Label(
+            remember_row,
+            text="",
+            bg=option_bg,
+            fg=COLOR_FG,
+            font=(FONT_FAMILY, 11),
+            padx=6,
+            pady=2,
+        )
+        remember_icon.pack(side="left")
+        remember_text = tk.Label(
+            remember_row,
+            text="永久保存此选项",
+            bg=option_bg,
+            fg=COLOR_FG,
+            font=(FONT_FAMILY, 10),
+            anchor="w",
+            justify="left",
+            padx=0,
+            pady=2,
+        )
+        remember_text.pack(side="left", fill="x", expand=True)
+
+        def refresh_remember_icon():
+            remember_icon.configure(text="☑" if remember_var.get() else "☐")
+
+        def toggle_remember(_e=None):
+            remember_var.set(not remember_var.get())
+            refresh_remember_icon()
+
+        def remember_enter(_e=None):
+            remember_row.configure(bg=option_hover)
+            remember_icon.configure(bg=option_hover)
+            remember_text.configure(bg=option_hover)
+
+        def remember_leave(_e=None):
+            remember_row.configure(bg=option_bg)
+            remember_icon.configure(bg=option_bg)
+            remember_text.configure(bg=option_bg)
+
+        for w in (remember_row, remember_icon, remember_text):
+            w.bind("<Button-1>", toggle_remember)
+            w.bind("<Enter>", remember_enter)
+            w.bind("<Leave>", remember_leave)
+        refresh_remember_icon()
+
+        result = {"ok": False}
+
+        def confirm():
+            result["ok"] = True
+            dlg.result = (mode_var.get(), bool(remember_var.get()))
+            dlg.close()
+
+        btn_row = tk.Frame(dlg.body, bg=COLOR_BG)
+        btn_row.pack(fill="x", pady=(12, 0))
+        flat_button(btn_row, "取消", dlg.close).pack(side="right", padx=(6, 0))
+        flat_button(btn_row, "确定", confirm, primary=True).pack(side="right")
+
+        dlg.place_near(self.root)
+        dlg.focus_force()
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+
+        if not result["ok"]:
+            return None
+        return dlg.result
+
+    def request_close(self):
+        """统一处理关闭动作：按用户配置决定托盘隐藏或退出程序。"""
+        saved_mode = self.app.prefs.get("close_mode", "tray")
+        saved_mode = saved_mode if saved_mode in ("tray", "quit") else "tray"
+        locked = bool(self.app.prefs.get("close_mode_locked", False))
+
+        mode = saved_mode
+        if not locked:
+            picked = self._ask_close_mode(initial_mode=saved_mode, initial_remember=False)
+            if picked is None:
+                return
+            mode, remember = picked
+            if remember:
+                self.app.set_pref("close_mode", mode)
+                self.app.set_pref("close_mode_locked", True)
+
+        if mode == "quit":
+            self.real_quit()
+        else:
+            self.hide_to_tray()
+
+    def show_close_mode_dialog(self):
+        """在设置中修改关闭模式与“是否永久保存”开关。"""
+        saved_mode = self.app.prefs.get("close_mode", "tray")
+        saved_mode = saved_mode if saved_mode in ("tray", "quit") else "tray"
+        locked = bool(self.app.prefs.get("close_mode_locked", False))
+        picked = self._ask_close_mode(initial_mode=saved_mode, initial_remember=locked)
+        if picked is None:
+            return
+        mode, remember = picked
+        self.app.set_pref("close_mode", mode)
+        self.app.set_pref("close_mode_locked", remember)
 
     def show_from_tray(self):
         """从托盘/隐藏状态恢复。"""
@@ -2401,76 +3026,115 @@ class FloatingBall:
     每张便笺最多对应一个悬浮球实例，由 NotesApp 统一管理。
     """
 
-    # 用一个不可能出现在图像里的颜色做 -transparentcolor，Windows 下可做到真透明
-    TRANSPARENT_KEY = "#ff00fe"
-
     def __init__(self, app, note):
         self.app = app
         self.note = note
         self.topmost = True
+        self._auto_hide_job = None
+        self._is_edge_hidden = False
+        self._is_dragging = False
+        self._last_interaction_dragged = False
 
         self.win = tk.Toplevel(app.root)
         self.win.overrideredirect(True)
         self.win.attributes("-topmost", self.topmost)
+
+        raw_img = _load_ball_image(BALL_SIZE)
+        if raw_img is None:
+            raise RuntimeError("floating ball image unavailable")
+        self._render_w, self._render_h = raw_img.size
+        self.win.configure(cursor="hand2")
+
+        # 初始位置：默认贴屏幕最右侧；y 尽量沿用便笺位置
         try:
-            self.win.attributes("-transparentcolor", self.TRANSPARENT_KEY)
-        except Exception:
-            # 非 Windows 时该属性不存在；允许显示方块背景
-            pass
-        self.win.configure(bg=self.TRANSPARENT_KEY)
-
-        size = BALL_SIZE
-        self.canvas = tk.Canvas(
-            self.win, width=size, height=size,
-            bg=self.TRANSPARENT_KEY, highlightthickness=0, bd=0,
-            cursor="hand2",
-        )
-        self.canvas.pack(fill="both", expand=True)
-
-        # 先存引用防止 PhotoImage 被 GC
-        self._photo = None
-        img = _load_ball_image(size)
-        if img is not None:
-            self._photo = _PILImageTk.PhotoImage(img)
-            self.canvas.create_image(size // 2, size // 2, image=self._photo)
-        else:
-            # 降级：纯色圆 + "便"
-            self.canvas.create_oval(2, 2, size - 2, size - 2,
-                                    fill="#3fb4e0", outline="")
-            self.canvas.create_text(size // 2, size // 2, text="便",
-                                    fill="#ffffff",
-                                    font=(FONT_FAMILY, 14, "bold"))
-
-        # 初始位置：优先沿用便笺当前位置右下角；其次屏幕右下
-        try:
-            nx, ny = note.root.winfo_x(), note.root.winfo_y()
-            if nx > -2000 and ny > -2000:
-                x = nx + max(0, note.root.winfo_width() - size - 10)
+            ny = note.root.winfo_y()
+            if ny > -2000:
                 y = ny + 8
             else:
                 raise ValueError
         except Exception:
-            sw = self.win.winfo_screenwidth()
             sh = self.win.winfo_screenheight()
-            x = sw - size - 24
-            y = sh - size - 120
-        self.win.geometry(f"{size}x{size}+{int(x)}+{int(y)}")
+            y = sh - self._render_h - 120
+        sw = self.win.winfo_screenwidth()
+        x = sw - self._render_w
+        self.win.geometry(f"{self._render_w}x{self._render_h}+{int(x)}+{int(y)}")
+        self.win.update_idletasks()
+
+        # 使用 Win32 分层窗口做按像素透明渲染（无色键）
+        try:
+            hwnd = ctypes.windll.user32.GetParent(self.win.winfo_id())
+            if not hwnd:
+                hwnd = self.win.winfo_id()
+            _update_layered_window_rgba(hwnd, raw_img, x, y)
+        except Exception as e:
+            raise RuntimeError(f"layered window init failed: {e}") from e
 
         # 拖拽 / 单击 / 右键
         self._drag = {"x": 0, "y": 0, "moved": False}
-        self.canvas.bind("<ButtonPress-1>", self._on_press)
-        self.canvas.bind("<B1-Motion>", self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
-        self.canvas.bind("<Double-Button-1>", lambda e: self.open_note())
-        self.canvas.bind("<Button-3>", self._on_right)
+        self.win.bind("<ButtonPress-1>", self._on_press)
+        self.win.bind("<B1-Motion>", self._on_drag)
+        self.win.bind("<ButtonRelease-1>", self._on_release)
+        self.win.bind("<Double-Button-1>", lambda e: self.open_note())
+        self.win.bind("<Button-3>", self._on_right)
+        self.win.bind("<Enter>", self._on_mouse_enter)
+        self.win.bind("<Leave>", self._on_mouse_leave)
+        self._schedule_right_edge_hide()
 
     # ------- 交互 -------
+    def _cancel_right_edge_hide(self):
+        if self._auto_hide_job:
+            try:
+                self.win.after_cancel(self._auto_hide_job)
+            except Exception:
+                pass
+            self._auto_hide_job = None
+
+    def _at_right_edge(self):
+        sw = self.win.winfo_screenwidth()
+        x = self.win.winfo_x()
+        right_edge = x + self._render_w
+        return abs(sw - right_edge) <= BALL_EDGE_TOLERANCE
+
+    def _schedule_right_edge_hide(self):
+        self._cancel_right_edge_hide()
+        if self._is_edge_hidden:
+            return
+        if not self._at_right_edge():
+            return
+        self._auto_hide_job = self.win.after(BALL_AUTO_HIDE_MS, self._hide_to_right_edge)
+
+    def _hide_to_right_edge(self):
+        self._auto_hide_job = None
+        if self._is_edge_hidden:
+            return
+        if not self._at_right_edge():
+            return
+        sw = self.win.winfo_screenwidth()
+        x = sw - BALL_PEEK
+        y = self.win.winfo_y()
+        self.win.geometry(f"+{int(x)}+{int(y)}")
+        self._is_edge_hidden = True
+
+    def _reveal_from_right_edge(self):
+        if not self._is_edge_hidden:
+            return
+        sw = self.win.winfo_screenwidth()
+        x = sw - self._render_w
+        y = self.win.winfo_y()
+        self.win.geometry(f"+{int(x)}+{int(y)}")
+        self._is_edge_hidden = False
+
     def _on_press(self, e):
+        self._cancel_right_edge_hide()
+        self._reveal_from_right_edge()
+        self._is_dragging = True
+        self._last_interaction_dragged = False
         self._drag["x"] = e.x_root - self.win.winfo_x()
         self._drag["y"] = e.y_root - self.win.winfo_y()
         self._drag["moved"] = False
 
     def _on_drag(self, e):
+        self._cancel_right_edge_hide()
         dx = abs(e.x_root - self.win.winfo_x() - self._drag["x"])
         dy = abs(e.y_root - self.win.winfo_y() - self._drag["y"])
         if dx + dy > 3:
@@ -2480,13 +3144,32 @@ class FloatingBall:
         self.win.geometry(f"+{int(x)}+{int(y)}")
 
     def _on_release(self, _e):
+        self._is_dragging = False
+        self._last_interaction_dragged = self._drag["moved"]
+        self._schedule_right_edge_hide()
         if not self._drag["moved"]:
             # 单击：打开便笺
             self.open_note()
 
+    def _on_mouse_enter(self, _e):
+        # 鼠标悬浮在露出的小角上时，自动展开完整悬浮球
+        self._cancel_right_edge_hide()
+        self._reveal_from_right_edge()
+        self._last_interaction_dragged = False
+
+    def _on_mouse_leave(self, _e):
+        if self._is_dragging:
+            return
+        # 没有发生拖动：离开即隐藏；拖动过则继续按延时隐藏
+        if not self._last_interaction_dragged:
+            self._hide_to_right_edge()
+        else:
+            self._schedule_right_edge_hide()
+
     def _on_right(self, e):
         menu = FlatMenu(self.win, min_width=170)
         menu.add_command("打开便笺", self.open_note)
+        menu.add_command("打开便笺列表…", self.app.show_note_picker)
         menu.add_command("关闭悬浮球", self.close_ball)
         menu.add_separator()
         menu.add_command("永不显示悬浮球", self.disable_ball_forever)
@@ -2524,6 +3207,7 @@ class FloatingBall:
         self.destroy()
 
     def destroy(self):
+        self._cancel_right_edge_hide()
         try:
             self.app._floating_balls.pop(self.note.note_id, None)
         except Exception:
@@ -2544,9 +3228,10 @@ class NotesApp:
         self.root.title("便笺")
         self.root.withdraw()
 
-        self.notes = {}          # note_id -> StickyNote
+        self.notes = {}          # note_id -> StickyNote (仅已加载的窗口)
         self._tray_icon = None
         self._floating_balls = {}  # note_id -> FloatingBall
+        self._all_note_ids = []    # 磁盘上所有已知便笺 id，按时间倒序（最新在前）
 
         # 确保目录存在
         os.makedirs(NOTES_DIR, exist_ok=True)
@@ -2562,11 +3247,12 @@ class NotesApp:
         # 启动托盘（单例；失败不致命）
         self._setup_tray()
 
-        # 加载全部便笺
-        self._load_all_notes()
-
-        # 若一张便笺也没有（首次启动），自动新建一张
-        if not self.notes:
+        # 扫描磁盘上所有便笺 id，只加载最新的一张
+        self._scan_note_ids()
+        if self._all_note_ids:
+            self.load_note(self._all_note_ids[0])
+        else:
+            # 首次启动：新建一张空白便笺
             self.new_note()
 
     # ------- 应用偏好 -------
@@ -2604,6 +3290,7 @@ class NotesApp:
     def _rebuild_all_notes(self):
         """保存 → 销毁 → 重建所有便笺，用于主题切换等需要整体刷新 UI 的场景。"""
         visible_states = {}
+        loaded_ids = []
         for nid, n in list(self.notes.items()):
             if n._destroyed:
                 continue
@@ -2612,6 +3299,7 @@ class NotesApp:
             except Exception:
                 pass
             visible_states[nid] = n._visible
+            loaded_ids.append(nid)
 
         # 销毁所有悬浮球（它们的颜色也由主题决定，但目前图标为图片，仅菜单颜色需要刷新）
         for nid in list(self._floating_balls.keys()):
@@ -2628,8 +3316,9 @@ class NotesApp:
                 pass
         self.notes.clear()
 
-        # 重新加载（会按 note_id 的字典序排列，结果与启动时一致）
-        self._load_all_notes()
+        # 仅重建「切换主题前已经加载过」的便笺，避免一次性把全部磁盘便笺都弹出来
+        for nid in loaded_ids:
+            self.load_note(nid)
 
         # 恢复显隐状态
         for nid, was_visible in visible_states.items():
@@ -2735,19 +3424,176 @@ class NotesApp:
                 except Exception:
                     pass
 
-    # ------- 加载 -------
-    def _load_all_notes(self):
+    # ------- 扫描 / 按需加载 -------
+    def _scan_note_ids(self):
+        """把磁盘上所有 notes/<id>.json 的 id 读进 self._all_note_ids，按时间倒序。"""
         try:
             files = [f for f in os.listdir(NOTES_DIR) if f.endswith(".json")]
         except Exception:
             files = []
-        for fn in sorted(files):
-            note_id = fn[:-5]
+        ids = [f[:-5] for f in files]
+        # id 形如 YYYYMMDD-HHMMSS(-n)，字典序倒排即时间倒排
+        ids.sort(reverse=True)
+        self._all_note_ids = ids
+
+    def load_note(self, note_id):
+        """打开指定便笺：若未加载则构造窗口；若已加载但隐藏则恢复显示。"""
+        existing = self.notes.get(note_id)
+        if existing is not None and not existing._destroyed:
+            self.show_note(existing)
+            return existing
+        # 检查文件是否真的存在（防止磁盘上已被删除）
+        if not os.path.exists(os.path.join(NOTES_DIR, f"{note_id}.json")):
+            return None
+        try:
+            note = StickyNote(self, note_id, is_new=False)
+        except Exception:
+            return None
+        self.notes[note_id] = note
+        if note_id not in self._all_note_ids:
+            self._all_note_ids.insert(0, note_id)
+        try:
+            note.root.lift()
+            note.root.focus_force()
+        except Exception:
+            pass
+        return note
+
+    def _load_all_notes(self):
+        """加载磁盘上所有便笺窗口。仅用于主题切换后的批量重建。"""
+        self._scan_note_ids()
+        for note_id in sorted(self._all_note_ids):
             try:
                 self.notes[note_id] = StickyNote(self, note_id, is_new=False)
             except Exception:
-                # 单张加载失败不影响其它便笺
                 pass
+
+    # ------- 便笺切换面板 -------
+    def show_note_picker(self, parent_window=None):
+        """弹出便笺选择器：列出所有便笺，点击即打开（未加载的会按需构造）。"""
+        self._scan_note_ids()
+        master = parent_window or self.root
+        dlg = FlatDialog(master, title="打开便笺", width=360)
+
+        tk.Label(
+            dlg.body,
+            text=f"共 {len(self._all_note_ids)} 张便笺，点击任意一张打开。",
+            bg=COLOR_BG, fg=COLOR_SUBTLE,
+            font=(FONT_FAMILY, 10), justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        # 工具条
+        tool_row = tk.Frame(dlg.body, bg=COLOR_BG)
+        tool_row.pack(fill="x", pady=(0, 6))
+        flat_button(
+            tool_row, "新建便笺",
+            lambda: (dlg.close(), self.new_note()),
+            primary=True,
+        ).pack(side="left")
+        flat_button(
+            tool_row, "显示全部",
+            lambda: (dlg.close(), self._open_all_notes()),
+        ).pack(side="left", padx=(8, 0))
+
+        # 列表区域（可滚动）
+        list_wrap = tk.Frame(dlg.body, bg=COLOR_BG,
+                             highlightthickness=1,
+                             highlightbackground=COLOR_BORDER)
+        list_wrap.pack(fill="both", expand=True, pady=(4, 10))
+
+        canvas = tk.Canvas(list_wrap, bg=COLOR_BG, highlightthickness=0,
+                           height=320)
+        canvas.pack(side="left", fill="both", expand=True)
+        sb = ttk.Scrollbar(list_wrap, orient="vertical", command=canvas.yview)
+        sb.pack(side="right", fill="y")
+        canvas.configure(yscrollcommand=sb.set)
+        inner = tk.Frame(canvas, bg=COLOR_BG)
+        canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def on_configure(_e=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+            # 让 inner 的宽度跟 canvas 走（避免空白）
+            canvas.itemconfig("all", width=canvas.winfo_width())
+        inner.bind("<Configure>", on_configure)
+        canvas.bind("<Configure>",
+                    lambda e: canvas.itemconfig(
+                        canvas.find_all()[0] if canvas.find_all() else "",
+                        width=e.width))
+        # 鼠标滚轮
+        canvas.bind_all("<MouseWheel>",
+                        lambda e: canvas.yview_scroll(
+                            int(-1 * (e.delta / 120)), "units"))
+
+        def pick(nid):
+            dlg.close()
+            self.load_note(nid)
+
+        for nid in self._all_note_ids:
+            # 读取标题（优先 json.title），落不到就用 id
+            title = self._read_note_title(nid) or f"note-{nid}"
+            loaded = nid in self.notes and not self.notes[nid]._destroyed
+            visible = loaded and self.notes[nid]._visible
+            status = "已打开" if visible else ("后台" if loaded else "未加载")
+            row = tk.Frame(inner, bg=COLOR_BG, cursor="hand2")
+            row.pack(fill="x")
+            title_lbl = tk.Label(
+                row, text=title, bg=COLOR_BG, fg=COLOR_FG,
+                anchor="w", font=(FONT_FAMILY, 10),
+                padx=10, pady=7,
+            )
+            title_lbl.pack(side="left", fill="x", expand=True)
+            id_lbl = tk.Label(
+                row, text=nid, bg=COLOR_BG, fg=COLOR_MUTED,
+                anchor="e", font=(FONT_FAMILY, 9),
+                padx=6, pady=7,
+            )
+            id_lbl.pack(side="right")
+            status_lbl = tk.Label(
+                row, text=status, bg=COLOR_BG, fg=COLOR_SUBTLE,
+                anchor="e", font=(FONT_FAMILY, 9),
+                padx=10, pady=7,
+            )
+            status_lbl.pack(side="right")
+
+            for w in (row, title_lbl, id_lbl, status_lbl):
+                w.bind("<Enter>",
+                       lambda _e, r=(row, title_lbl, id_lbl, status_lbl): (
+                           [x.configure(bg=COLOR_BTN_HOVER) for x in r]))
+                w.bind("<Leave>",
+                       lambda _e, r=(row, title_lbl, id_lbl, status_lbl): (
+                           [x.configure(bg=COLOR_BG) for x in r]))
+                w.bind("<Button-1>", lambda _e, k=nid: pick(k))
+
+        # 解绑滚轮（对话框关闭时）
+        def on_close():
+            try:
+                canvas.unbind_all("<MouseWheel>")
+            except Exception:
+                pass
+        dlg.bind("<Destroy>", lambda _e: on_close())
+
+        btn_row = tk.Frame(dlg.body, bg=COLOR_BG)
+        btn_row.pack(fill="x")
+        flat_button(btn_row, "关闭", dlg.close).pack(side="right")
+
+        dlg.place_near(master)
+        dlg.focus_force()
+
+    def _read_note_title(self, note_id):
+        """只读 title 字段，用于选择器。失败返回 None。"""
+        path = os.path.join(NOTES_DIR, f"{note_id}.json")
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            return data.get("title") or data.get("window", {}).get("title")
+        except Exception:
+            return None
+
+    def _open_all_notes(self):
+        """一次性打开所有磁盘上的便笺（老行为）。供"显示全部"使用。"""
+        self._scan_note_ids()
+        for nid in self._all_note_ids:
+            self.load_note(nid)
 
     # ------- 新建 / 隐藏 / 显示 -------
     def new_note(self):
@@ -2757,6 +3603,8 @@ class NotesApp:
         except Exception:
             return None
         self.notes[note_id] = note
+        if note_id not in self._all_note_ids:
+            self._all_note_ids.insert(0, note_id)
         try:
             note.root.lift()
             note.root.focus_force()
@@ -2820,7 +3668,26 @@ class NotesApp:
             pass
         note._visible = True
 
+    def show_current_note(self):
+        """托盘默认动作：恢复当前（最近）便笺，不触发新建。"""
+        # 优先按时间倒序恢复已加载便笺；未加载则尝试先加载再显示。
+        self._scan_note_ids()
+        for nid in self._all_note_ids:
+            note = self.notes.get(nid)
+            if note is not None and not note._destroyed:
+                self.show_note(note)
+                return
+        if self._all_note_ids:
+            note = self.load_note(self._all_note_ids[0])
+            if note is not None:
+                self.show_note(note)
+
     def show_all(self):
+        # 先把磁盘上未加载的便笺补上，再恢复所有隐藏的
+        self._scan_note_ids()
+        for nid in list(self._all_note_ids):
+            if nid not in self.notes or self.notes[nid]._destroyed:
+                self.load_note(nid)
         for n in list(self.notes.values()):
             if not n._destroyed and not n._visible:
                 self.show_note(n)
@@ -2862,7 +3729,10 @@ class NotesApp:
                 return lambda icon, item: self.root.after(0, fn)
 
             menu = pystray.Menu(
-                pystray.MenuItem("新建便笺", _cb(self.new_note), default=True),
+                pystray.MenuItem("打开当前便笺", _cb(self.show_current_note), default=True),
+                pystray.MenuItem("新建便笺", _cb(self.new_note)),
+                pystray.MenuItem("打开便笺…", _cb(self.show_note_picker)),
+                pystray.Menu.SEPARATOR,
                 pystray.MenuItem("显示全部", _cb(self.show_all)),
                 pystray.MenuItem("隐藏全部", _cb(self.hide_all)),
                 pystray.Menu.SEPARATOR,
