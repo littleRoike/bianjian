@@ -23,9 +23,11 @@ if (Test-Path ".\dist")  { Remove-Item -Recurse -Force ".\dist"  }
 Get-ChildItem -Filter "*.spec" | Remove-Item -Force -ErrorAction SilentlyContinue
 
 # -w 隐藏控制台；-F 单文件；--name 指定产物名
+# --add-data "static;static"：把悬浮球图标一并打包进 EXE
 .\venv\Scripts\python.exe -m PyInstaller -w -F --name "便笺" --clean `
     --hidden-import pystray._win32 `
     --hidden-import PIL._tkinter_finder `
+    --add-data "static;static" `
     main.py
 
 Write-Host "`n完成！产物位于:" -ForegroundColor Green

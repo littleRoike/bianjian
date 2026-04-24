@@ -4,6 +4,12 @@
 notes.md
 notes.json
 config.json
+# 新版多便笺：每张便笺 md + json 都落在 notes/ 下
+notes/
+# 应用全局偏好（如"永不显示悬浮球"）
+app.json
+# 老版本数据迁移后的备份
+*.migrated
 
 # ---------------------------------------------------------
 # Python 虚拟环境

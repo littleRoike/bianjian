@@ -9,7 +9,9 @@ import re
 import sys
 import json
 import base64
+import shutil
 import threading
+from datetime import datetime
 import tkinter as tk
 from tkinter import ttk, colorchooser, filedialog, messagebox
 
@@ -21,6 +23,19 @@ try:
 except Exception:
     _HAS_TRAY = False
 
+# Pillow 图像 → Tk 位图（用于悬浮球）。与托盘不同，未装 PIL 时悬浮球降级为纯画布。
+try:
+    from PIL import Image as _PILImage, ImageTk as _PILImageTk
+    _HAS_PIL_TK = True
+except Exception:
+    _HAS_PIL_TK = False
+
+
+def resource_path(rel: str) -> str:
+    """兼容 PyInstaller：冻结后读 `_MEIPASS`，否则读源码目录。"""
+    base = getattr(sys, "_MEIPASS", None) or os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, rel)
+
 # ------------------------------------------------------------
 # 常量
 # ------------------------------------------------------------
@@ -31,19 +46,129 @@ CHECKED = "\u2611"    # ☑
 FONT_FAMILY = "Microsoft YaHei UI"
 FONT_SIZE = 11
 
-# 配色（极简清爽）
-COLOR_BG = "#ffffff"
-COLOR_FG = "#3c3c3c"
-COLOR_SUBTLE = "#8a8a8a"
-COLOR_MUTED = "#b5b5b5"
-COLOR_BORDER = "#e6e6e6"
-COLOR_TOOLBAR_BG = "#fafafa"
-COLOR_BTN_HOVER = "#eef1f5"
-COLOR_HIGHLIGHT = "#fff2a8"
-COLOR_SELECT = "#d8d8d8"          # 统一为柔和灰色选中
-COLOR_MENU_SEP = "#ececec"
-COLOR_TOOLTIP_BG = "#2b2b2b"
-COLOR_TOOLTIP_FG = "#ffffff"
+# ------------------------------------------------------------
+# 主题（配色）
+# ------------------------------------------------------------
+# 每套主题定义一组颜色；模块级 COLOR_xxx 常量由 apply_theme(name) 动态赋值。
+# - simple_white 保留原来的极简白风格（默认）
+# - 其余几套是"浅亮"取向的备选，可在"更多 → 主题颜色…"中切换
+THEMES = {
+    "simple_white": {
+        "label": "简约白 · 默认",
+        "BG": "#ffffff",
+        "FG": "#3c3c3c",
+        "SUBTLE": "#8a8a8a",
+        "MUTED": "#b5b5b5",
+        "BORDER": "#e6e6e6",
+        "TOP_BG": "#ffffff",
+        "TOOLBAR_BG": "#fafafa",
+        "BTN_HOVER": "#eef1f5",
+        "HIGHLIGHT": "#fff2a8",
+        "SELECT": "#d8d8d8",
+        "MENU_SEP": "#ececec",
+        "TOOLTIP_BG": "#2b2b2b",
+        "TOOLTIP_FG": "#ffffff",
+    },
+    "warm_cream": {
+        "label": "奶油米 · 温润",
+        "BG": "#fffdf6",
+        "FG": "#3c3a34",
+        "SUBTLE": "#8f8a7d",
+        "MUTED": "#bdb6a6",
+        "BORDER": "#ecd9b8",
+        "TOP_BG": "#fff7dd",
+        "TOOLBAR_BG": "#fff4cc",
+        "BTN_HOVER": "#f3e7c1",
+        "HIGHLIGHT": "#ffeb99",
+        "SELECT": "#e5d6ae",
+        "MENU_SEP": "#efe3c3",
+        "TOOLTIP_BG": "#3c3a34",
+        "TOOLTIP_FG": "#fffdf6",
+    },
+    "sky_mint": {
+        "label": "天青薄荷 · 清爽",
+        "BG": "#fafdff",
+        "FG": "#2f4256",
+        "SUBTLE": "#7e94a7",
+        "MUTED": "#b2c3d2",
+        "BORDER": "#d4e2f0",
+        "TOP_BG": "#eef7fd",
+        "TOOLBAR_BG": "#e6f3fb",
+        "BTN_HOVER": "#d5ebf8",
+        "HIGHLIGHT": "#cdf5e4",
+        "SELECT": "#c7dcee",
+        "MENU_SEP": "#dbe7f2",
+        "TOOLTIP_BG": "#2f4256",
+        "TOOLTIP_FG": "#fafdff",
+    },
+    "dusk_rose": {
+        "label": "暮光粉 · 柔和",
+        "BG": "#fffafc",
+        "FG": "#4a3440",
+        "SUBTLE": "#9d7a8b",
+        "MUTED": "#c8b4bf",
+        "BORDER": "#e6d3dc",
+        "TOP_BG": "#fdeef3",
+        "TOOLBAR_BG": "#fbe3eb",
+        "BTN_HOVER": "#f2d4df",
+        "HIGHLIGHT": "#ffd9ea",
+        "SELECT": "#e9cddc",
+        "MENU_SEP": "#eed5df",
+        "TOOLTIP_BG": "#4a3440",
+        "TOOLTIP_FG": "#fffafc",
+    },
+    "sage_paper": {
+        "label": "草本米 · 护眼",
+        "BG": "#f6f7f1",
+        "FG": "#3a4138",
+        "SUBTLE": "#85917e",
+        "MUTED": "#b4bcae",
+        "BORDER": "#d9ded0",
+        "TOP_BG": "#edefe3",
+        "TOOLBAR_BG": "#e7ebdd",
+        "BTN_HOVER": "#dce2cd",
+        "HIGHLIGHT": "#ecf2b4",
+        "SELECT": "#d7ddc7",
+        "MENU_SEP": "#dde2d2",
+        "TOOLTIP_BG": "#3a4138",
+        "TOOLTIP_FG": "#f6f7f1",
+    },
+}
+DEFAULT_THEME = "simple_white"
+
+# 模块级颜色常量（被整份代码引用）；由 apply_theme 动态覆盖。
+COLOR_BG = COLOR_FG = COLOR_SUBTLE = COLOR_MUTED = COLOR_BORDER = ""
+COLOR_TOP_BG = COLOR_TOOLBAR_BG = COLOR_BTN_HOVER = COLOR_HIGHLIGHT = ""
+COLOR_SELECT = COLOR_MENU_SEP = COLOR_TOOLTIP_BG = COLOR_TOOLTIP_FG = ""
+CURRENT_THEME = DEFAULT_THEME
+
+
+def apply_theme(name: str):
+    """把指定主题写入模块级 COLOR_xxx 常量。不重绘任何窗口；
+    调用方需要自行刷新/重建 UI 才能看到效果。"""
+    global COLOR_BG, COLOR_FG, COLOR_SUBTLE, COLOR_MUTED, COLOR_BORDER
+    global COLOR_TOP_BG, COLOR_TOOLBAR_BG, COLOR_BTN_HOVER, COLOR_HIGHLIGHT
+    global COLOR_SELECT, COLOR_MENU_SEP, COLOR_TOOLTIP_BG, COLOR_TOOLTIP_FG
+    global CURRENT_THEME
+    theme = THEMES.get(name) or THEMES[DEFAULT_THEME]
+    CURRENT_THEME = name if name in THEMES else DEFAULT_THEME
+    COLOR_BG = theme["BG"]
+    COLOR_FG = theme["FG"]
+    COLOR_SUBTLE = theme["SUBTLE"]
+    COLOR_MUTED = theme["MUTED"]
+    COLOR_BORDER = theme["BORDER"]
+    COLOR_TOP_BG = theme["TOP_BG"]
+    COLOR_TOOLBAR_BG = theme["TOOLBAR_BG"]
+    COLOR_BTN_HOVER = theme["BTN_HOVER"]
+    COLOR_HIGHLIGHT = theme["HIGHLIGHT"]
+    COLOR_SELECT = theme["SELECT"]
+    COLOR_MENU_SEP = theme["MENU_SEP"]
+    COLOR_TOOLTIP_BG = theme["TOOLTIP_BG"]
+    COLOR_TOOLTIP_FG = theme["TOOLTIP_FG"]
+
+
+# 先用默认主题初始化一次，模块其它位置才能安全引用 COLOR_xxx
+apply_theme(DEFAULT_THEME)
 
 # 任务优先级：背景色 (淡色用于整行)、点色 (深色用于菜单圆点标记)
 PRIORITY_ORDER = ("urgent", "high", "normal", "low")
@@ -84,9 +209,31 @@ def get_data_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-SAVE_MD = os.path.join(get_data_dir(), "notes.md")
-SAVE_JSON = os.path.join(get_data_dir(), "notes.json")
-CONFIG_FILE = os.path.join(get_data_dir(), "config.json")
+# 多便笺：每张便笺单独一个文件，放在 notes/ 子目录
+NOTES_DIR = os.path.join(get_data_dir(), "notes")
+
+# 老版本单便笺文件（仅在迁移时读取；迁移后会被重命名为 .migrated）
+LEGACY_MD = os.path.join(get_data_dir(), "notes.md")
+LEGACY_JSON = os.path.join(get_data_dir(), "notes.json")
+LEGACY_CONFIG = os.path.join(get_data_dir(), "config.json")
+
+# 应用全局偏好（与具体便笺无关的开关，如"永不显示悬浮球"）
+APP_PREFS_PATH = os.path.join(get_data_dir(), "app.json")
+
+# 悬浮球图标路径（打包时通过 --add-data 带上 static 目录）
+BALL_IMAGE_PATH = resource_path(os.path.join("static", "便笺.png"))
+BALL_SIZE = 48
+
+
+def new_note_id() -> str:
+    """生成新便笺 ID：YYYYMMDD-HHMMSS，必要时加后缀避免同秒内冲突。"""
+    base = datetime.now().strftime("%Y%m%d-%H%M%S")
+    candidate = base
+    suffix = 1
+    while os.path.exists(os.path.join(NOTES_DIR, f"{candidate}.json")):
+        suffix += 1
+        candidate = f"{base}-{suffix}"
+    return candidate
 
 
 # ------------------------------------------------------------
@@ -377,30 +524,49 @@ def flat_messagebox(master, title, message, kind="info"):
 # 主类
 # ------------------------------------------------------------
 class StickyNote:
-    def __init__(self):
-        self.root = tk.Tk()
-        self.root.title("便笺")
+    """单张便笺窗口。
 
-        # 无边框
+    不直接持有 tk.Tk()；由 NotesApp 管理生命周期，自身是一个 Toplevel。
+    所有数据根据 note_id 派生到 notes/<id>.md / notes/<id>.json。
+    """
+
+    def __init__(self, app, note_id, is_new=False):
+        self.app = app
+        self.note_id = note_id
+        self.md_path = os.path.join(NOTES_DIR, f"{note_id}.md")
+        self.json_path = os.path.join(NOTES_DIR, f"{note_id}.json")
+
+        self.root = tk.Toplevel(app.root)
         self.root.overrideredirect(True)
-
-        # 基础样式
         self.root.configure(bg=COLOR_BORDER)
 
-        # 读取配置
-        self.config = self._load_config()
-        geo = self.config.get("geometry", f"{INIT_W}x{INIT_H}+240+160")
+        # 读取配置（从 json 内嵌的 window 段）
+        self.config = self._load_window_config()
+
+        if self.config.get("geometry"):
+            geo = self.config["geometry"]
+        else:
+            # 新便笺：按现有便笺数做堆叠偏移，避免全部重叠
+            idx = len(app.notes)
+            off = idx * 28
+            geo = f"{INIT_W}x{INIT_H}+{240 + off}+{160 + off}"
         self.root.geometry(geo)
         self.root.minsize(MIN_W, MIN_H)
 
         self.pinned = self.config.get("pinned", True)
         self.transparency = float(self.config.get("transparency", 1.0))
         self.highlight_color = self.config.get("highlight_color", COLOR_HIGHLIGHT)
+        # 便笺标题：默认 note-<id>；用户可点击顶栏中央编辑
+        self.title_text = self.config.get("title") or f"note-{note_id}"
+        try:
+            self.root.title(self.title_text)
+        except Exception:
+            pass
 
         self.root.attributes("-topmost", self.pinned)
         self.root.attributes("-alpha", self.transparency)
 
-        # 任务栏显示（可选：overrideredirect会让窗口不出现在任务栏，需特殊处理）
+        # 让无边框 Toplevel 也出现在任务栏
         self.root.after(10, self._register_taskbar)
 
         # 状态变量
@@ -410,13 +576,13 @@ class StickyNote:
         self._reorder_job = None
         self._reordering = False
         self._click_lock = False
-        self._press_info = None  # {"x", "y", "line", "col", "dragged"}
+        self._press_info = None
         self._minimize_pending_restore = False
-        self._hide_state = "visible"  # visible / hidden / animating
-        self._hide_edge = None  # "left"
+        self._hide_state = "visible"
+        self._hide_edge = None
         self._edge_check_job = None
         self._visible = True
-        self._tray_icon = None
+        self._destroyed = False
 
         self._build_ui()
         self._bind_events()
@@ -425,33 +591,56 @@ class StickyNote:
         # 定时检查贴边
         self._schedule_edge_check()
 
-        # 窗口关闭协议：改为"隐藏到托盘"
+        # 窗口关闭协议：×按钮 → 隐藏到托盘（由 app 统一管理）
         self.root.protocol("WM_DELETE_WINDOW", self.hide_to_tray)
 
-        # 启动系统托盘图标（后台线程）
-        self._setup_tray()
+        # 新便笺：立刻落盘一次，确保文件存在
+        if is_new:
+            try:
+                self._save_notes(force=False)
+            except Exception:
+                pass
 
     # --------------------------------------------------------
-    # 配置
+    # 配置（内嵌在 <id>.json 的 window 段）
     # --------------------------------------------------------
-    def _load_config(self):
-        if os.path.exists(CONFIG_FILE):
+    def _load_window_config(self):
+        """从本便笺的 json 里读取窗口配置；读不到返回 {}。"""
+        if os.path.exists(self.json_path):
             try:
-                with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                with open(self.json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                win = data.get("window", {})
+                if isinstance(win, dict):
+                    return win
             except Exception:
-                return {}
+                pass
         return {}
 
     def _save_config(self):
+        """仅更新 json 的 window 段，不重序列化 lines（频繁调用的轻量路径）。"""
+        if self._destroyed:
+            return
         try:
-            data = {
+            os.makedirs(NOTES_DIR, exist_ok=True)
+            if os.path.exists(self.json_path):
+                try:
+                    with open(self.json_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                except Exception:
+                    data = {"version": 2, "lines": []}
+            else:
+                data = {"version": 2, "lines": []}
+            data["id"] = self.note_id
+            data["title"] = self.title_text
+            data["window"] = {
                 "geometry": self.root.geometry(),
                 "pinned": self.pinned,
                 "transparency": self.transparency,
                 "highlight_color": self.highlight_color,
+                "title": self.title_text,
             }
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            with open(self.json_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
         except Exception:
             pass
@@ -485,30 +674,62 @@ class StickyNote:
         self.container = container
 
         # 顶栏
-        self.top_bar = tk.Frame(container, bg=COLOR_BG, height=38)
+        self.top_bar = tk.Frame(container, bg=COLOR_TOP_BG, height=40)
         self.top_bar.pack(fill="x", side="top")
         self.top_bar.pack_propagate(False)
 
-        left = tk.Frame(self.top_bar, bg=COLOR_BG)
+        left = tk.Frame(self.top_bar, bg=COLOR_TOP_BG)
         left.pack(side="left", padx=6)
-        self._icon_btn(left, "\u002B", self.new_task_top, tip="新建任务", size=18).pack(side="left", padx=1)
-        self._icon_btn(left, "\u22EF", self.show_more_menu, tip="更多", size=18).pack(side="left", padx=1)
+        self._icon_btn(left, "\u002B", self.app.new_note,
+                       tip="新建便笺", size=18,
+                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
+        self._icon_btn(left, "\u22EF", self.show_more_menu,
+                       tip="更多", size=18,
+                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
 
-        right = tk.Frame(self.top_bar, bg=COLOR_BG)
+        # 中间：便笺标题（点击可编辑）
+        self.title_frame = tk.Frame(self.top_bar, bg=COLOR_TOP_BG)
+        self.title_frame.pack(side="left", fill="x", expand=True, padx=2)
+        self.title_label = tk.Label(
+            self.title_frame,
+            text=self.title_text,
+            bg=COLOR_TOP_BG,
+            fg=COLOR_SUBTLE,
+            font=(FONT_FAMILY, 10),
+            cursor="hand2",
+            anchor="center",
+        )
+        self.title_label.pack(fill="x", expand=True)
+        self.title_label.bind("<Button-1>", self._begin_edit_title)
+        self.title_label.bind("<Double-Button-1>", self._begin_edit_title)
+        # 拖动：非标题也要能拖动窗口（标题本身点击是编辑，用右键拖动稍复杂；
+        # 保持标题区域不拖动，top_bar 其它区域拖动）
+        self.title_entry = None  # lazy-create
+
+        right = tk.Frame(self.top_bar, bg=COLOR_TOP_BG)
         right.pack(side="right", padx=6)
-        self.pin_btn = self._icon_btn(right, self._pin_icon(), self.toggle_pin, tip="置顶", size=13)
+        self.pin_btn = self._icon_btn(
+            right, self._pin_icon(), self.toggle_pin, tip="置顶", size=13,
+            bg_override=COLOR_TOP_BG,
+        )
         self.pin_btn.pack(side="left", padx=1)
         self._icon_btn(right, "\u2013", self.minimize_window,
-                       tip="最小化", size=14).pack(side="left", padx=1)
+                       tip="最小化为悬浮球", size=14,
+                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
         self._icon_btn(right, "\u2715", self.hide_to_tray,
                        tip="隐藏到托盘 (右下角角标)",
-                       size=14, hover=COLOR_BTN_HOVER).pack(side="left", padx=1)
+                       size=14, hover=COLOR_BTN_HOVER,
+                       bg_override=COLOR_TOP_BG).pack(side="left", padx=1)
 
-        # 顶栏用作拖动
-        for w in (self.top_bar,):
+        # 顶栏（除标题区）用作拖动
+        for w in (self.top_bar, left, right):
             w.bind("<ButtonPress-1>", self._start_move)
             w.bind("<B1-Motion>", self._do_move)
             w.bind("<Double-Button-1>", lambda e: None)
+
+        # 顶栏与内容区之间的分隔线（与底栏分隔线呼应）
+        sep_top = tk.Frame(container, bg=COLOR_BORDER, height=1)
+        sep_top.pack(fill="x", side="top")
 
         # 编辑区
         text_frame = tk.Frame(container, bg=COLOR_BG)
@@ -637,12 +858,14 @@ class StickyNote:
 
         # "更多" 菜单（自定义扁平风格）—— 所有偏好设置都直接展开
         self.more_menu = FlatMenu(self.root, min_width=240)
+        self.more_menu.add_command("新建便笺", self.app.new_note)
         self.more_menu.add_command("新建任务", self.new_task_top)
         self.more_menu.add_command("切换任务 / 增删复选框", self.toggle_task_lines, "Ctrl+L")
         self.more_menu.add_separator()
         self.more_menu.add_command("切换置顶", self.toggle_pin)
         self.more_menu.add_command("透明度调节\u2026", self.show_transparency_dialog)
         self.more_menu.add_command("高亮颜色\u2026", self.choose_highlight_color)
+        self.more_menu.add_command("主题颜色\u2026", self.show_theme_dialog)
         self.more_menu.add_separator()
         self.more_menu.add_command("手动保存", lambda: self._save_notes(force=True), "Ctrl+S")
         self.more_menu.add_command("清空所有任务", self.clear_all)
@@ -650,18 +873,23 @@ class StickyNote:
         self.more_menu.add_separator()
         self.more_menu.add_command("最小化", self.minimize_window)
         self.more_menu.add_command("隐藏到托盘", self.hide_to_tray)
+        self.more_menu.add_command("删除此便笺", self.delete_this_note)
         self.more_menu.add_command("关于", self.show_about)
         self.more_menu.add_command("退出程序", self.real_quit)
 
     # --------------------------------------------------------
     # 按钮工厂
     # --------------------------------------------------------
-    def _icon_btn(self, parent, text, cmd, tip="", size=14, hover=COLOR_BTN_HOVER):
-        btn = tk.Label(parent, text=text, bg=COLOR_BG, fg=COLOR_SUBTLE,
+    def _icon_btn(self, parent, text, cmd, tip="", size=14,
+                  hover=None, bg_override=None):
+        # 默认参数若直接写 COLOR_xxx 会被 def 时求值，切主题就失效——这里延迟到调用时再取
+        base_bg = bg_override if bg_override else COLOR_BG
+        hover_bg = hover if hover else COLOR_BTN_HOVER
+        btn = tk.Label(parent, text=text, bg=base_bg, fg=COLOR_SUBTLE,
                        font=(FONT_FAMILY, size), padx=8, pady=2, cursor="hand2")
         btn.bind("<Button-1>", lambda e: cmd())
-        btn.bind("<Enter>", lambda e: btn.configure(bg=hover, fg=COLOR_FG))
-        btn.bind("<Leave>", lambda e: btn.configure(bg=COLOR_BG, fg=COLOR_SUBTLE))
+        btn.bind("<Enter>", lambda e: btn.configure(bg=hover_bg, fg=COLOR_FG))
+        btn.bind("<Leave>", lambda e: btn.configure(bg=base_bg, fg=COLOR_SUBTLE))
         if tip:
             self._attach_tooltip(btn, tip)
         return btn
@@ -1343,15 +1571,150 @@ class StickyNote:
 
     def open_save_dir(self):
         try:
-            os.startfile(get_data_dir())
+            os.makedirs(NOTES_DIR, exist_ok=True)
+            os.startfile(NOTES_DIR)
         except Exception:
             pass
+
+    # --------------------------------------------------------
+    # 主题颜色（切换后重建所有便笺）
+    # --------------------------------------------------------
+    def show_theme_dialog(self):
+        """弹出主题选择器：每项一行，点击即应用并持久化。"""
+        dlg = FlatDialog(self.root, title="主题颜色", width=320)
+        tk.Label(
+            dlg.body,
+            text="选择一个配色主题，所有便笺会一起切换。",
+            bg=COLOR_BG,
+            fg=COLOR_SUBTLE,
+            font=(FONT_FAMILY, 10),
+            justify="left",
+            wraplength=320,
+        ).pack(anchor="w", pady=(0, 10))
+
+        list_frame = tk.Frame(dlg.body, bg=COLOR_BG)
+        list_frame.pack(fill="both", expand=True)
+
+        def apply_and_close(name):
+            dlg.close()
+            try:
+                self.app.set_theme(name)
+            except Exception:
+                pass
+
+        for key, theme in THEMES.items():
+            is_current = (key == CURRENT_THEME)
+            row = tk.Frame(list_frame, bg=COLOR_BG, cursor="hand2")
+            row.pack(fill="x", pady=2)
+            # 色卡（主色 + 顶栏 + 工具栏 3 小块）
+            swatch = tk.Canvas(
+                row, width=58, height=24,
+                bg=COLOR_BG, highlightthickness=0, bd=0,
+            )
+            swatch.create_rectangle(0, 0, 20, 24, fill=theme["BG"], outline=theme["BORDER"])
+            swatch.create_rectangle(20, 0, 40, 24, fill=theme["TOP_BG"], outline=theme["BORDER"])
+            swatch.create_rectangle(40, 0, 58, 24, fill=theme["TOOLBAR_BG"], outline=theme["BORDER"])
+            swatch.pack(side="left", padx=(4, 10), pady=4)
+
+            lbl_text = theme["label"] + ("   （当前）" if is_current else "")
+            lbl = tk.Label(
+                row, text=lbl_text,
+                bg=COLOR_BG,
+                fg=COLOR_FG if is_current else COLOR_SUBTLE,
+                anchor="w",
+                font=(FONT_FAMILY, 10, "bold" if is_current else "normal"),
+                padx=2, pady=4,
+            )
+            lbl.pack(side="left", fill="x", expand=True)
+
+            for w in (row, swatch, lbl):
+                w.bind("<Enter>", lambda _e, wgs=(row, lbl): (
+                    wgs[0].configure(bg=COLOR_BTN_HOVER),
+                    wgs[1].configure(bg=COLOR_BTN_HOVER),
+                ))
+                w.bind("<Leave>", lambda _e, wgs=(row, lbl): (
+                    wgs[0].configure(bg=COLOR_BG),
+                    wgs[1].configure(bg=COLOR_BG),
+                ))
+                w.bind("<Button-1>", lambda _e, k=key: apply_and_close(k))
+
+        btn_row = tk.Frame(dlg.body, bg=COLOR_BG)
+        btn_row.pack(fill="x", pady=(10, 0))
+        flat_button(btn_row, "关闭", dlg.close).pack(side="right")
+
+        dlg.place_near(self.root)
+        dlg.focus_force()
+
+    # --------------------------------------------------------
+    # 便笺标题编辑
+    # --------------------------------------------------------
+    def _begin_edit_title(self, _event=None):
+        """点击标题 → 切换为 Entry，可修改。"""
+        if self.title_entry is not None:
+            try:
+                self.title_entry.focus_set()
+            except Exception:
+                pass
+            return
+        # 隐藏 label，用 Entry 覆盖
+        var = tk.StringVar(value=self.title_text)
+        entry = tk.Entry(
+            self.title_frame,
+            textvariable=var,
+            bg="#ffffff",
+            fg=COLOR_FG,
+            font=(FONT_FAMILY, 10),
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=COLOR_BORDER,
+            highlightcolor=COLOR_BORDER,
+            justify="center",
+        )
+        self.title_label.pack_forget()
+        entry.pack(fill="x", expand=True, padx=2, pady=4)
+        entry.focus_set()
+        entry.select_range(0, "end")
+        self.title_entry = entry
+
+        def commit(_e=None):
+            new_name = var.get().strip()
+            if not new_name:
+                new_name = f"note-{self.note_id}"
+            self.title_text = new_name
+            self.title_label.configure(text=new_name)
+            try:
+                entry.destroy()
+            except Exception:
+                pass
+            self.title_entry = None
+            self.title_label.pack(fill="x", expand=True)
+            try:
+                self.root.title(new_name)
+            except Exception:
+                pass
+            self._schedule_save()
+            try:
+                self._save_config()
+            except Exception:
+                pass
+
+        def cancel(_e=None):
+            try:
+                entry.destroy()
+            except Exception:
+                pass
+            self.title_entry = None
+            self.title_label.pack(fill="x", expand=True)
+
+        entry.bind("<Return>", commit)
+        entry.bind("<FocusOut>", commit)
+        entry.bind("<Escape>", cancel)
 
     def show_about(self):
         flat_messagebox(
             self.root,
             "关于",
-            "极简悬浮便笺 v1.0\n\n纯 Python + Tkinter 实现\n\n数据以标准 Markdown 保存于程序目录：\nnotes.md",
+            "极简悬浮便笺 v1.1\n\n纯 Python + Tkinter 实现\n支持多窗口便笺 · 每张便笺独立文件\n\n数据保存目录：\nnotes/<id>.md + notes/<id>.json",
         )
 
     # --------------------------------------------------------
@@ -1442,13 +1805,25 @@ class StickyNote:
         self._saving_job = self.root.after(400, self._save_notes)
 
     def _save_notes(self, force=False):
+        if self._destroyed:
+            return
         try:
             md_lines, data = self._serialize()
-            with open(SAVE_MD, "w", encoding="utf-8") as f:
+            # 内嵌 window 配置 + id
+            data["id"] = self.note_id
+            data["title"] = self.title_text
+            data["window"] = {
+                "geometry": self.root.geometry(),
+                "pinned": self.pinned,
+                "transparency": self.transparency,
+                "highlight_color": self.highlight_color,
+                "title": self.title_text,
+            }
+            os.makedirs(NOTES_DIR, exist_ok=True)
+            with open(self.md_path, "w", encoding="utf-8") as f:
                 f.write("\n".join(md_lines))
-            with open(SAVE_JSON, "w", encoding="utf-8") as f:
+            with open(self.json_path, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=2)
-            self._save_config()
         except Exception as e:
             if force:
                 flat_messagebox(self.root, "保存失败", str(e))
@@ -1536,18 +1911,18 @@ class StickyNote:
     def _load_notes(self):
         """优先从 JSON 还原（含格式），否则从 MD 解析。"""
         loaded = False
-        if os.path.exists(SAVE_JSON):
+        if os.path.exists(self.json_path):
             try:
-                with open(SAVE_JSON, "r", encoding="utf-8") as f:
+                with open(self.json_path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self._load_from_json(data)
                 loaded = True
             except Exception:
                 loaded = False
 
-        if not loaded and os.path.exists(SAVE_MD):
+        if not loaded and os.path.exists(self.md_path):
             try:
-                with open(SAVE_MD, "r", encoding="utf-8") as f:
+                with open(self.md_path, "r", encoding="utf-8") as f:
                     content = f.read()
                 self._load_from_md(content)
                 loaded = True
@@ -1824,31 +2199,20 @@ class StickyNote:
         if start_line == end_line:
             # 单行：选区已由 _on_selection_changed 避开 prefix
             self.text.delete(start, end)
+            self.text.mark_set("insert", start)
             self._schedule_save()
             return
 
-        # --- 多行：自底向上删除 ---
-        # 末行：删除"选区末端"之前的文字部分
-        is_task_end, _c, plen_end = self._line_prefix_info(end_line)
-        keep_col_end = plen_end if is_task_end else 0
-        if self.text.compare(f"{end_line}.{keep_col_end}", "<", end):
-            self.text.delete(f"{end_line}.{keep_col_end}", end)
-
-        # 中间行：删除文字部分（保留 prefix）
-        for ln in range(end_line - 1, start_line, -1):
-            is_task_mid, _c, plen_mid = self._line_prefix_info(ln)
-            keep_col = plen_mid if is_task_mid else 0
-            line_end_col = int(self.text.index(f"{ln}.end").split(".")[1])
-            if keep_col < line_end_col:
-                self.text.delete(f"{ln}.{keep_col}", f"{ln}.end")
-
-        # 首行：从选区起点删到该行末
-        first_line_end_col = int(self.text.index(f"{start_line}.end").split(".")[1])
-        if start_col < first_line_end_col:
-            self.text.delete(start, f"{start_line}.end")
-
-        # 光标定位到首行选区起点
-        self.text.mark_set("insert", f"{start_line}.{start_col}")
+        # --- 多行：一次性跨行删除 ---
+        # 选区 start 在首行 prefix 之后，end 在末行某位置。直接 delete(start, end)
+        # 会把中间所有行（含 checkbox、换行）合并吃掉，末行剩余文字被拼到首行 prefix 之后。
+        # 这是用户对"跨行选中后按退格"的自然预期。首行的 checkbox 永远被保留，因为
+        # _on_selection_changed 已经把 start_col 卡在 prefix 之后。
+        try:
+            self.text.delete(start, end)
+        except tk.TclError:
+            return
+        self.text.mark_set("insert", start)
         # 清除选区
         self.text.tag_remove("sel", "1.0", "end")
 
@@ -1900,103 +2264,43 @@ class StickyNote:
             pass
 
     # --------------------------------------------------------
-    # 系统托盘 / 后台运行
+    # 最小化 / 隐藏 / 退出（统一由 NotesApp 协调）
     # --------------------------------------------------------
-    def _make_tray_image(self):
-        """动态绘制托盘图标（64x64）：深灰圆角底 + 白色横线 + 绿色勾。"""
-        size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-        draw = ImageDraw.Draw(img)
-        # 便笺主体（圆角矩形）
-        try:
-            draw.rounded_rectangle([4, 6, 60, 60], radius=10,
-                                   fill=(50, 50, 50, 255))
-        except AttributeError:
-            draw.rectangle([4, 6, 60, 60], fill=(50, 50, 50, 255))
-        # 顶部两条"纸张"线
-        draw.line([(14, 18), (50, 18)], fill=(230, 230, 230, 255), width=2)
-        draw.line([(14, 26), (40, 26)], fill=(180, 180, 180, 255), width=2)
-        # 绿色勾
-        draw.line([(14, 42), (26, 52)], fill=(110, 206, 110, 255), width=4)
-        draw.line([(26, 52), (50, 34)], fill=(110, 206, 110, 255), width=4)
-        return img
-
-    def _setup_tray(self):
-        if not _HAS_TRAY:
-            return
-        try:
-            image = self._make_tray_image()
-
-            def _label_show_hide(_item):
-                return "隐藏便笺" if self._visible else "显示便笺"
-
-            def _label_pin(_item):
-                return "取消置顶" if self.pinned else "置顶显示"
-
-            def _cb(fn):
-                return lambda icon, item: self.root.after(0, fn)
-
-            menu = pystray.Menu(
-                pystray.MenuItem(_label_show_hide,
-                                 _cb(self.toggle_visible),
-                                 default=True),
-                pystray.MenuItem("新建任务",
-                                 _cb(self._tray_new_task)),
-                pystray.MenuItem(_label_pin,
-                                 _cb(self._tray_toggle_pin)),
-                pystray.Menu.SEPARATOR,
-                pystray.MenuItem("退出便笺",
-                                 lambda icon, item: self.root.after(0, self.real_quit)),
-            )
-
-            self._tray_icon = pystray.Icon(
-                "bianjian",
-                image,
-                "极简悬浮便笺",
-                menu=menu,
-            )
-
-            t = threading.Thread(target=self._tray_icon.run, daemon=True)
-            t.start()
-        except Exception:
-            # 托盘初始化失败不致命
-            self._tray_icon = None
-
-    def _tray_new_task(self):
-        self.show_from_tray()
-        self.new_task_top()
-
-    def _tray_toggle_pin(self):
-        self.toggle_pin()
-        if self._tray_icon is not None:
-            try:
-                self._tray_icon.update_menu()
-            except Exception:
-                pass
-
-    def _tray_refresh_menu(self):
-        if self._tray_icon is not None:
-            try:
-                self._tray_icon.update_menu()
-            except Exception:
-                pass
-
     def minimize_window(self):
-        """最小化到任务栏。
+        """最小化。默认变成一个可拖拽的悬浮球；
 
-        overrideredirect(True) 的窗口无法直接 iconify（Windows 下无反应），
-        需要先临时关闭无边框模式；当用户从任务栏点回来时再恢复。
+        若用户在悬浮球右键菜单里选过"永不显示悬浮球"，则回退为传统任务栏 iconify。
         """
         try:
             self._save_config()
         except Exception:
             pass
+
+        if not self.app.prefs.get("never_ball") and _HAS_PIL_TK:
+            # 悬浮球模式：隐藏便笺 + 显示悬浮球
+            try:
+                self.root.withdraw()
+            except Exception:
+                pass
+            self._visible = False
+            try:
+                self.app.show_floating_ball(self)
+            except Exception:
+                # 悬浮球创建失败时回退传统最小化
+                self._legacy_minimize()
+            return
+
+        self._legacy_minimize()
+
+    def _legacy_minimize(self):
+        """传统最小化到任务栏。overrideredirect(True) 的窗口不能直接 iconify，
+        需要先临时关闭无边框模式；用户从任务栏点回来时 `<Map>` 事件负责恢复样式。
+        """
         self._minimize_pending_restore = True
         try:
             self.root.overrideredirect(False)
             self.root.iconify()
         except Exception:
-            # 兜底：若最小化失败，回退到"隐藏到托盘"
             self._minimize_pending_restore = False
             try:
                 self.root.overrideredirect(True)
@@ -2022,52 +2326,569 @@ class StickyNote:
         except Exception:
             pass
 
+    def delete_this_note(self):
+        """永久删除当前便笺（弹确认框）。"""
+        ok = flat_messagebox(
+            self.root, "删除便笺",
+            f"确定要永久删除这张便笺吗？\n内容无法恢复。\n\nID: {self.note_id}",
+            kind="yesno",
+        )
+        if ok:
+            try:
+                self.app.delete_note(self)
+            except Exception:
+                pass
+
     def hide_to_tray(self):
-        """关闭按钮：隐藏到托盘，程序继续在后台运行。"""
-        # 无托盘时直接退出，避免用户找不到入口
-        if not _HAS_TRAY or self._tray_icon is None:
-            self.real_quit()
-            return
-        try:
-            self._save_notes(force=False)
-            self._save_config()
-        except Exception:
-            pass
-        self.root.withdraw()
-        self._visible = False
-        self._tray_refresh_menu()
+        """关闭按钮：把本便笺隐藏到托盘。委托给 NotesApp 决定是否真正退出。"""
+        self.app.hide_note(self)
 
     def show_from_tray(self):
-        """从托盘恢复主窗口。"""
-        self.root.deiconify()
-        # overrideredirect 窗口 withdraw/deiconify 后可能丢失样式，这里重新应用
-        try:
-            self.root.overrideredirect(True)
-            self.root.attributes("-topmost", self.pinned)
-            self.root.attributes("-alpha", self.transparency)
-        except Exception:
-            pass
-        self.root.lift()
-        try:
-            self.root.focus_force()
-        except Exception:
-            pass
-        self._visible = True
-        self._tray_refresh_menu()
-
-    def toggle_visible(self):
-        if self._visible:
-            self.hide_to_tray()
-        else:
-            self.show_from_tray()
+        """从托盘/隐藏状态恢复。"""
+        self.app.show_note(self)
 
     def real_quit(self):
-        """真正退出程序（保存 + 停止托盘 + 销毁窗口）。"""
+        """兼容老引用：由 app 统一退出整个程序。"""
+        self.app.real_quit()
+
+    # 兼容旧引用
+    def close_app(self):
+        self.hide_to_tray()
+
+    def destroy(self):
+        """永久销毁当前便笺窗口（不删文件；仅在 NotesApp 调用时使用）。"""
+        self._destroyed = True
+        # 顺手撤掉对应悬浮球
         try:
-            self._save_notes(force=False)
-            self._save_config()
+            self.app.destroy_floating_ball(self.note_id)
         except Exception:
             pass
+        # 停掉可能的延时任务，避免悬挂回调
+        for job_attr in ("_saving_job", "_reorder_job", "_edge_check_job"):
+            j = getattr(self, job_attr, None)
+            if j:
+                try:
+                    self.root.after_cancel(j)
+                except Exception:
+                    pass
+                setattr(self, job_attr, None)
+        try:
+            self.root.destroy()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------
+# 悬浮球：最小化时代替任务栏图标，支持拖拽、右键菜单
+# ------------------------------------------------------------
+def _load_ball_image(size=BALL_SIZE):
+    """加载 static/便笺.png，缩放到 size。失败返回 None。"""
+    if not _HAS_PIL_TK:
+        return None
+    if not os.path.exists(BALL_IMAGE_PATH):
+        return None
+    try:
+        img = _PILImage.open(BALL_IMAGE_PATH).convert("RGBA")
+        img = img.resize((size, size), _PILImage.LANCZOS)
+        return img
+    except Exception:
+        return None
+
+
+class FloatingBall:
+    """最小化后的悬浮球：圆形、可拖动、双击/单击恢复便笺、右键菜单。
+
+    每张便笺最多对应一个悬浮球实例，由 NotesApp 统一管理。
+    """
+
+    # 用一个不可能出现在图像里的颜色做 -transparentcolor，Windows 下可做到真透明
+    TRANSPARENT_KEY = "#ff00fe"
+
+    def __init__(self, app, note):
+        self.app = app
+        self.note = note
+        self.topmost = True
+
+        self.win = tk.Toplevel(app.root)
+        self.win.overrideredirect(True)
+        self.win.attributes("-topmost", self.topmost)
+        try:
+            self.win.attributes("-transparentcolor", self.TRANSPARENT_KEY)
+        except Exception:
+            # 非 Windows 时该属性不存在；允许显示方块背景
+            pass
+        self.win.configure(bg=self.TRANSPARENT_KEY)
+
+        size = BALL_SIZE
+        self.canvas = tk.Canvas(
+            self.win, width=size, height=size,
+            bg=self.TRANSPARENT_KEY, highlightthickness=0, bd=0,
+            cursor="hand2",
+        )
+        self.canvas.pack(fill="both", expand=True)
+
+        # 先存引用防止 PhotoImage 被 GC
+        self._photo = None
+        img = _load_ball_image(size)
+        if img is not None:
+            self._photo = _PILImageTk.PhotoImage(img)
+            self.canvas.create_image(size // 2, size // 2, image=self._photo)
+        else:
+            # 降级：纯色圆 + "便"
+            self.canvas.create_oval(2, 2, size - 2, size - 2,
+                                    fill="#3fb4e0", outline="")
+            self.canvas.create_text(size // 2, size // 2, text="便",
+                                    fill="#ffffff",
+                                    font=(FONT_FAMILY, 14, "bold"))
+
+        # 初始位置：优先沿用便笺当前位置右下角；其次屏幕右下
+        try:
+            nx, ny = note.root.winfo_x(), note.root.winfo_y()
+            if nx > -2000 and ny > -2000:
+                x = nx + max(0, note.root.winfo_width() - size - 10)
+                y = ny + 8
+            else:
+                raise ValueError
+        except Exception:
+            sw = self.win.winfo_screenwidth()
+            sh = self.win.winfo_screenheight()
+            x = sw - size - 24
+            y = sh - size - 120
+        self.win.geometry(f"{size}x{size}+{int(x)}+{int(y)}")
+
+        # 拖拽 / 单击 / 右键
+        self._drag = {"x": 0, "y": 0, "moved": False}
+        self.canvas.bind("<ButtonPress-1>", self._on_press)
+        self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        self.canvas.bind("<Double-Button-1>", lambda e: self.open_note())
+        self.canvas.bind("<Button-3>", self._on_right)
+
+    # ------- 交互 -------
+    def _on_press(self, e):
+        self._drag["x"] = e.x_root - self.win.winfo_x()
+        self._drag["y"] = e.y_root - self.win.winfo_y()
+        self._drag["moved"] = False
+
+    def _on_drag(self, e):
+        dx = abs(e.x_root - self.win.winfo_x() - self._drag["x"])
+        dy = abs(e.y_root - self.win.winfo_y() - self._drag["y"])
+        if dx + dy > 3:
+            self._drag["moved"] = True
+        x = e.x_root - self._drag["x"]
+        y = e.y_root - self._drag["y"]
+        self.win.geometry(f"+{int(x)}+{int(y)}")
+
+    def _on_release(self, _e):
+        if not self._drag["moved"]:
+            # 单击：打开便笺
+            self.open_note()
+
+    def _on_right(self, e):
+        menu = FlatMenu(self.win, min_width=170)
+        menu.add_command("打开便笺", self.open_note)
+        menu.add_command("关闭悬浮球", self.close_ball)
+        menu.add_separator()
+        menu.add_command("永不显示悬浮球", self.disable_ball_forever)
+        menu.add_separator()
+        label_pin = "取消置顶" if self.topmost else "置于顶层"
+        menu.add_command(label_pin, self.toggle_pin)
+        menu.popup(e.x_root, e.y_root)
+
+    # ------- 动作 -------
+    def toggle_pin(self):
+        self.topmost = not self.topmost
+        try:
+            self.win.attributes("-topmost", self.topmost)
+        except Exception:
+            pass
+
+    def open_note(self):
+        # 恢复便笺窗口 + 销毁悬浮球
+        self.destroy()
+        try:
+            self.app.show_note(self.note)
+        except Exception:
+            pass
+
+    def close_ball(self):
+        """关闭悬浮球：便笺保持隐藏，用户只能通过托盘恢复。"""
+        self.destroy()
+
+    def disable_ball_forever(self):
+        """永不显示悬浮球：写入全局偏好；关闭当前悬浮球并把便笺隐藏到托盘。"""
+        try:
+            self.app.set_pref("never_ball", True)
+        except Exception:
+            pass
+        self.destroy()
+
+    def destroy(self):
+        try:
+            self.app._floating_balls.pop(self.note.note_id, None)
+        except Exception:
+            pass
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+
+
+# ------------------------------------------------------------
+# NotesApp：多便笺管理器（持有唯一的 tk.Tk() 与唯一的托盘图标）
+# ------------------------------------------------------------
+class NotesApp:
+    def __init__(self):
+        # 唯一的 Tk 根；自身不显示，只作为所有 Toplevel 便笺的父容器
+        self.root = tk.Tk()
+        self.root.title("便笺")
+        self.root.withdraw()
+
+        self.notes = {}          # note_id -> StickyNote
+        self._tray_icon = None
+        self._floating_balls = {}  # note_id -> FloatingBall
+
+        # 确保目录存在
+        os.makedirs(NOTES_DIR, exist_ok=True)
+
+        # 读取应用级偏好（全局，非便笺内嵌）
+        self.prefs = self._load_prefs()
+        # 应用主题色（默认 simple_white）
+        apply_theme(self.prefs.get("theme", DEFAULT_THEME))
+
+        # 迁移老版本单便笺数据
+        self._migrate_legacy()
+
+        # 启动托盘（单例；失败不致命）
+        self._setup_tray()
+
+        # 加载全部便笺
+        self._load_all_notes()
+
+        # 若一张便笺也没有（首次启动），自动新建一张
+        if not self.notes:
+            self.new_note()
+
+    # ------- 应用偏好 -------
+    def _load_prefs(self):
+        try:
+            if os.path.exists(APP_PREFS_PATH):
+                with open(APP_PREFS_PATH, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except Exception:
+            pass
+        return {}
+
+    def set_pref(self, key, value):
+        self.prefs[key] = value
+        try:
+            with open(APP_PREFS_PATH, "w", encoding="utf-8") as f:
+                json.dump(self.prefs, f, ensure_ascii=False, indent=2)
+        except Exception:
+            pass
+
+    # ------- 主题切换 -------
+    def set_theme(self, name):
+        """切换主题：写入偏好 + 重建所有便笺（保留文本与显隐状态）。"""
+        if name not in THEMES or name == CURRENT_THEME:
+            # 名字不合法或没变化：无事发生
+            if name in THEMES:
+                self.set_pref("theme", name)
+            return
+        self.set_pref("theme", name)
+        apply_theme(name)
+        self._rebuild_all_notes()
+
+    def _rebuild_all_notes(self):
+        """保存 → 销毁 → 重建所有便笺，用于主题切换等需要整体刷新 UI 的场景。"""
+        visible_states = {}
+        for nid, n in list(self.notes.items()):
+            if n._destroyed:
+                continue
+            try:
+                n._save_notes(force=False)
+            except Exception:
+                pass
+            visible_states[nid] = n._visible
+
+        # 销毁所有悬浮球（它们的颜色也由主题决定，但目前图标为图片，仅菜单颜色需要刷新）
+        for nid in list(self._floating_balls.keys()):
+            try:
+                self.destroy_floating_ball(nid)
+            except Exception:
+                pass
+
+        # 销毁所有便笺窗口
+        for n in list(self.notes.values()):
+            try:
+                n.destroy()
+            except Exception:
+                pass
+        self.notes.clear()
+
+        # 重新加载（会按 note_id 的字典序排列，结果与启动时一致）
+        self._load_all_notes()
+
+        # 恢复显隐状态
+        for nid, was_visible in visible_states.items():
+            n = self.notes.get(nid)
+            if n is None:
+                continue
+            if not was_visible:
+                try:
+                    n.root.withdraw()
+                    n._visible = False
+                except Exception:
+                    pass
+
+    # ------- 悬浮球 -------
+    def show_floating_ball(self, note):
+        """为指定便笺显示悬浮球（若已存在则直接 lift）。"""
+        ball = self._floating_balls.get(note.note_id)
+        if ball is not None:
+            try:
+                ball.win.deiconify()
+                ball.win.lift()
+            except Exception:
+                pass
+            return ball
+        try:
+            ball = FloatingBall(self, note)
+        except Exception:
+            return None
+        self._floating_balls[note.note_id] = ball
+        return ball
+
+    def destroy_floating_ball(self, note_id):
+        ball = self._floating_balls.pop(note_id, None)
+        if ball is not None:
+            try:
+                ball.win.destroy()
+            except Exception:
+                pass
+
+    # ------- 迁移 -------
+    def _migrate_legacy(self):
+        """把老版本 notes.md / notes.json / config.json 迁移为 notes/<ts>.*。
+
+        迁移成功后，把老文件重命名为 .migrated，避免下次又被识别。
+        """
+        # 若 notes/ 下已经有 json，视为新布局，不再迁移
+        try:
+            existing = [f for f in os.listdir(NOTES_DIR) if f.endswith(".json")]
+        except Exception:
+            existing = []
+        if existing:
+            return
+        if not (os.path.exists(LEGACY_JSON) or os.path.exists(LEGACY_MD)):
+            return
+
+        ts = new_note_id()
+        legacy_config = {}
+        if os.path.exists(LEGACY_CONFIG):
+            try:
+                with open(LEGACY_CONFIG, "r", encoding="utf-8") as f:
+                    legacy_config = json.load(f)
+            except Exception:
+                legacy_config = {}
+
+        data = None
+        if os.path.exists(LEGACY_JSON):
+            try:
+                with open(LEGACY_JSON, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = None
+        if data is None:
+            data = {"version": 2, "lines": []}
+
+        data["id"] = ts
+        data["window"] = {
+            "geometry": legacy_config.get("geometry",
+                                          f"{INIT_W}x{INIT_H}+240+160"),
+            "pinned": legacy_config.get("pinned", True),
+            "transparency": float(legacy_config.get("transparency", 1.0)),
+            "highlight_color": legacy_config.get("highlight_color", COLOR_HIGHLIGHT),
+        }
+
+        try:
+            with open(os.path.join(NOTES_DIR, f"{ts}.json"),
+                      "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception:
+            return  # 迁移失败则保留老文件
+
+        # 复制 md（保留老数据的完整性）
+        if os.path.exists(LEGACY_MD):
+            try:
+                shutil.copy2(LEGACY_MD, os.path.join(NOTES_DIR, f"{ts}.md"))
+            except Exception:
+                pass
+
+        # 老文件改名，避免重复迁移
+        for p in (LEGACY_JSON, LEGACY_MD, LEGACY_CONFIG):
+            if os.path.exists(p):
+                try:
+                    os.replace(p, p + ".migrated")
+                except Exception:
+                    pass
+
+    # ------- 加载 -------
+    def _load_all_notes(self):
+        try:
+            files = [f for f in os.listdir(NOTES_DIR) if f.endswith(".json")]
+        except Exception:
+            files = []
+        for fn in sorted(files):
+            note_id = fn[:-5]
+            try:
+                self.notes[note_id] = StickyNote(self, note_id, is_new=False)
+            except Exception:
+                # 单张加载失败不影响其它便笺
+                pass
+
+    # ------- 新建 / 隐藏 / 显示 -------
+    def new_note(self):
+        note_id = new_note_id()
+        try:
+            note = StickyNote(self, note_id, is_new=True)
+        except Exception:
+            return None
+        self.notes[note_id] = note
+        try:
+            note.root.lift()
+            note.root.focus_force()
+        except Exception:
+            pass
+        return note
+
+    def delete_note(self, note):
+        """永久删除一张便笺（文件 + 窗口）。若删完一张不剩，自动新建空白便笺。"""
+        if note._destroyed:
+            return
+        note_id = note.note_id
+        try:
+            note.destroy()
+        except Exception:
+            pass
+        self.notes.pop(note_id, None)
+        for p in (os.path.join(NOTES_DIR, f"{note_id}.json"),
+                  os.path.join(NOTES_DIR, f"{note_id}.md")):
+            try:
+                if os.path.exists(p):
+                    os.remove(p)
+            except Exception:
+                pass
+        # 没剩下任何便笺时，自动新建一张，避免用户陷入"无入口"
+        if not any((not n._destroyed) for n in self.notes.values()):
+            self.new_note()
+
+    def hide_note(self, note):
+        if note._destroyed:
+            return
+        try:
+            note._save_notes(force=False)
+        except Exception:
+            pass
+        try:
+            note.root.withdraw()
+        except Exception:
+            pass
+        note._visible = False
+        # 关闭（×）也把可能的悬浮球一起撤掉
+        self.destroy_floating_ball(note.note_id)
+        # 无托盘兜底：若用户把所有便笺都关掉又没有托盘入口，就直接退出程序
+        if not _HAS_TRAY or self._tray_icon is None:
+            if all((n._destroyed or not n._visible) for n in self.notes.values()):
+                self.real_quit()
+
+    def show_note(self, note):
+        if note._destroyed:
+            return
+        # 若该便笺当前有悬浮球，一并销毁
+        self.destroy_floating_ball(note.note_id)
+        try:
+            note.root.deiconify()
+            note.root.overrideredirect(True)
+            note.root.attributes("-topmost", note.pinned)
+            note.root.attributes("-alpha", note.transparency)
+            note.root.lift()
+            note.root.focus_force()
+        except Exception:
+            pass
+        note._visible = True
+
+    def show_all(self):
+        for n in list(self.notes.values()):
+            if not n._destroyed and not n._visible:
+                self.show_note(n)
+
+    def hide_all(self):
+        for n in list(self.notes.values()):
+            if not n._destroyed and n._visible:
+                self.hide_note(n)
+
+    def toggle_all(self):
+        if any((not n._destroyed and n._visible) for n in self.notes.values()):
+            self.hide_all()
+        else:
+            self.show_all()
+
+    # ------- 托盘 -------
+    def _make_tray_image(self):
+        size = 64
+        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(img)
+        try:
+            draw.rounded_rectangle([4, 6, 60, 60], radius=10,
+                                   fill=(50, 50, 50, 255))
+        except AttributeError:
+            draw.rectangle([4, 6, 60, 60], fill=(50, 50, 50, 255))
+        draw.line([(14, 18), (50, 18)], fill=(230, 230, 230, 255), width=2)
+        draw.line([(14, 26), (40, 26)], fill=(180, 180, 180, 255), width=2)
+        draw.line([(14, 42), (26, 52)], fill=(110, 206, 110, 255), width=4)
+        draw.line([(26, 52), (50, 34)], fill=(110, 206, 110, 255), width=4)
+        return img
+
+    def _setup_tray(self):
+        if not _HAS_TRAY:
+            return
+        try:
+            image = self._make_tray_image()
+
+            def _cb(fn):
+                return lambda icon, item: self.root.after(0, fn)
+
+            menu = pystray.Menu(
+                pystray.MenuItem("新建便笺", _cb(self.new_note), default=True),
+                pystray.MenuItem("显示全部", _cb(self.show_all)),
+                pystray.MenuItem("隐藏全部", _cb(self.hide_all)),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem("退出便笺",
+                                 lambda icon, item: self.root.after(0, self.real_quit)),
+            )
+
+            self._tray_icon = pystray.Icon("bianjian", image, "极简悬浮便笺", menu=menu)
+            threading.Thread(target=self._tray_icon.run, daemon=True).start()
+        except Exception:
+            self._tray_icon = None
+
+    # ------- 退出 -------
+    def real_quit(self):
+        for n in list(self.notes.values()):
+            try:
+                if not n._destroyed:
+                    n._save_notes(force=False)
+            except Exception:
+                pass
+        # 销毁所有悬浮球
+        for nid in list(self._floating_balls.keys()):
+            try:
+                self.destroy_floating_ball(nid)
+            except Exception:
+                pass
         if self._tray_icon is not None:
             try:
                 self._tray_icon.visible = False
@@ -2075,21 +2896,22 @@ class StickyNote:
             except Exception:
                 pass
             self._tray_icon = None
+        for n in list(self.notes.values()):
+            try:
+                n.destroy()
+            except Exception:
+                pass
         try:
             self.root.destroy()
         except Exception:
             pass
-
-    # 兼容旧引用
-    def close_app(self):
-        self.hide_to_tray()
 
     def run(self):
         self.root.mainloop()
 
 
 def main():
-    app = StickyNote()
+    app = NotesApp()
     app.run()
 
 
