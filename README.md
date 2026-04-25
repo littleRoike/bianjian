@@ -27,12 +27,12 @@ bianjian/
 └── venv/              # 虚拟环境（由下方命令创建）
 ```
 
-运行/打包后会在同目录生成：
+运行/打包后，便笺与配置会写入你在首次启动时选择的统一数据目录，典型结构：
 
 ```
-notes.md        # 标准 Markdown 任务清单，可用任意笔记软件打开
-notes.json      # 带完整格式元数据的备份（保证格式无损还原）
-config.json     # 窗口位置、置顶、透明度等偏好
+storage_path.json   # 路径引导文件（固定在 exe 同目录）
+notes/              # 多便笺数据目录
+app.json            # 应用全局偏好
 ```
 
 ## 开发与运行
@@ -80,6 +80,36 @@ pyinstaller -w -F --name "便笺" main.py
 - `-F`：打包为单一 EXE 文件
 
 打包产物位于 `dist\便笺.exe`，复制到任意 Windows 电脑双击即可使用（免安装 Python 环境）。
+
+## 生成安装包（推荐）
+
+先安装 [Inno Setup 6](https://jrsoftware.org/isinfo.php)，然后执行：
+
+```powershell
+.\build-installer.ps1
+```
+
+脚本会自动：
+
+1. 检查并生成 `dist\便笺.exe`（若不存在）
+2. 调用 `installer.iss` 生成安装包
+3. 输出 `dist\便笺-安装包.exe`
+
+安装版默认安装到可写目录（按安装向导可调整），首次启动仍会让用户选择统一数据目录；后续便笺数据与配置都按该目录同步保存。
+
+### Inno Setup 6 安装步骤（Windows）
+
+1. 打开官网下载安装器：<https://jrsoftware.org/isdl.php>
+2. 运行安装程序，建议保持默认选项（包含 `Inno Setup Preprocessor`）
+3. 安装完成后，通常会生成：
+   - `C:\Program Files\Inno Setup 6\ISCC.exe`
+4. 打开 PowerShell 验证：
+
+```powershell
+& "C:\Program Files\Inno Setup 6\ISCC.exe" /?
+```
+
+若能看到帮助信息，说明安装成功；之后即可执行 `.\build-installer.ps1` 生成安装包。
 
 ## 数据格式
 

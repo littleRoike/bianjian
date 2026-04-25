@@ -221,16 +221,180 @@ def get_data_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-# 多便笺：每张便笺单独一个文件，放在 notes/ 子目录
-NOTES_DIR = os.path.join(get_data_dir(), "notes")
+APP_DIR = get_data_dir()
+STORAGE_BOOTSTRAP_PATH = os.path.join(APP_DIR, "storage_path.json")
+DEFAULT_STORAGE_DIR = os.path.join(APP_DIR, "data")
 
-# 老版本单便笺文件（仅在迁移时读取；迁移后会被重命名为 .migrated）
-LEGACY_MD = os.path.join(get_data_dir(), "notes.md")
-LEGACY_JSON = os.path.join(get_data_dir(), "notes.json")
-LEGACY_CONFIG = os.path.join(get_data_dir(), "config.json")
+# 运行时路径（首次启动后按 storage_root 动态重定向）
+STORAGE_ROOT = APP_DIR
+NOTES_DIR = ""
+LEGACY_MD = ""
+LEGACY_JSON = ""
+LEGACY_CONFIG = ""
+APP_PREFS_PATH = ""
 
-# 应用全局偏好（与具体便笺无关的开关，如"永不显示悬浮球"）
-APP_PREFS_PATH = os.path.join(get_data_dir(), "app.json")
+
+def configure_storage_paths(storage_root: str):
+    """切换运行时存储路径，后续所有文件读写统一走该目录。"""
+    global STORAGE_ROOT, NOTES_DIR, LEGACY_MD, LEGACY_JSON, LEGACY_CONFIG, APP_PREFS_PATH
+    root = os.path.abspath(storage_root)
+    STORAGE_ROOT = root
+    NOTES_DIR = os.path.join(root, "notes")
+    # 兼容迁移：老版本文件名仍在存储根目录下查找
+    LEGACY_MD = os.path.join(root, "notes.md")
+    LEGACY_JSON = os.path.join(root, "notes.json")
+    LEGACY_CONFIG = os.path.join(root, "config.json")
+    APP_PREFS_PATH = os.path.join(root, "app.json")
+
+
+def _load_bootstrap_storage_root():
+    """读取首次启动保存的存储目录。"""
+    try:
+        if not os.path.exists(STORAGE_BOOTSTRAP_PATH):
+            return None
+        with open(STORAGE_BOOTSTRAP_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        root = data.get("storage_root")
+        if isinstance(root, str) and root.strip():
+            return os.path.abspath(root.strip())
+    except Exception:
+        pass
+    return None
+
+
+def _save_bootstrap_storage_root(storage_root: str):
+    """把存储目录写入引导文件（仅主路径：exe 同目录）。"""
+    payload = {"storage_root": os.path.abspath(storage_root)}
+    with open(STORAGE_BOOTSTRAP_PATH, "w", encoding="utf-8") as f:
+        json.dump(payload, f, ensure_ascii=False, indent=2)
+
+
+def _pick_storage_root_dialog(master, title: str, intro: str,
+                              initial_path: str) -> str | None:
+    """统一风格的存储路径选择对话框。"""
+    selected = {"path": initial_path, "value": None}
+    dlg = FlatDialog(master, title=title, width=460)
+    tk.Label(
+        dlg.body,
+        text=intro,
+        bg=COLOR_BG,
+        fg=COLOR_FG,
+        font=(FONT_FAMILY, 10),
+        justify="left",
+        wraplength=420,
+    ).pack(anchor="w", pady=(0, 10))
+
+    row = tk.Frame(dlg.body, bg=COLOR_BG)
+    row.pack(fill="x")
+    path_var = tk.StringVar(value=selected["path"])
+    entry = tk.Entry(
+        row,
+        textvariable=path_var,
+        relief="flat",
+        bg=COLOR_BG,
+        fg=COLOR_FG,
+        highlightthickness=1,
+        highlightbackground=COLOR_BORDER,
+        highlightcolor=COLOR_BORDER,
+        insertbackground=COLOR_FG,
+        font=(FONT_FAMILY, 10),
+    )
+    entry.pack(side="left", fill="x", expand=True, ipady=5)
+
+    def choose_dir():
+        picked = filedialog.askdirectory(
+            parent=dlg,
+            title="选择便笺与配置存储目录",
+            initialdir=path_var.get() or APP_DIR,
+        )
+        if picked:
+            path_var.set(picked)
+
+    flat_button(row, "浏览…", choose_dir).pack(side="left", padx=(8, 0))
+
+    hint = tk.Label(
+        dlg.body,
+        text=f"建议：{DEFAULT_STORAGE_DIR}",
+        bg=COLOR_BG,
+        fg=COLOR_SUBTLE,
+        font=(FONT_FAMILY, 9),
+        justify="left",
+    )
+    hint.pack(anchor="w", pady=(8, 14))
+
+    btn_row = tk.Frame(dlg.body, bg=COLOR_BG)
+    btn_row.pack(fill="x")
+
+    def on_cancel():
+        selected["value"] = None
+        dlg.close()
+
+    def on_confirm():
+        target = os.path.abspath((path_var.get() or "").strip())
+        if not target:
+            flat_messagebox(dlg, "提示", "请先选择一个有效目录。", kind="info")
+            return
+        try:
+            os.makedirs(target, exist_ok=True)
+        except Exception as e:
+            flat_messagebox(dlg, "提示", f"无法创建目录：{e}", kind="info")
+            return
+        selected["value"] = target
+        dlg.close()
+
+    flat_button(btn_row, "退出", on_cancel).pack(side="right", padx=(6, 0))
+    flat_button(btn_row, "确定", on_confirm, primary=True).pack(side="right")
+
+    sw = master.winfo_screenwidth()
+    sh = master.winfo_screenheight()
+    dlg.update_idletasks()
+    dw, dh = max(460, dlg.winfo_reqwidth()), dlg.winfo_reqheight()
+    x = (sw - dw) // 2
+    y = (sh - dh) // 2
+    dlg.geometry(f"{dw}x{dh}+{x}+{y}")
+    dlg.focus_force()
+    dlg.grab_set()
+    master.wait_window(dlg)
+    return selected["value"]
+
+
+def _pick_storage_root_first_run() -> str | None:
+    """首次启动引导：统一选择“便笺文件 + 配置文件”的存储目录。"""
+    picker_root = tk.Tk()
+    picker_root.withdraw()
+    picker_root.update_idletasks()
+    try:
+        return _pick_storage_root_dialog(
+            picker_root,
+            title="首次启动设置",
+            intro="请选择便笺文件与配置文件的统一存储路径。\n后续启动会固定使用该路径。",
+            initial_path=DEFAULT_STORAGE_DIR,
+        )
+    finally:
+        try:
+            picker_root.destroy()
+        except Exception:
+            pass
+
+
+def resolve_storage_root() -> str | None:
+    """解析本次运行的存储目录；首次运行会弹窗引导选择。"""
+    root = _load_bootstrap_storage_root()
+    if root:
+        return root
+    picked = _pick_storage_root_first_run()
+    if not picked:
+        return None
+    try:
+        _save_bootstrap_storage_root(picked)
+    except Exception:
+        # 即使引导文件写入失败，也继续启动并使用本次用户选择的路径。
+        # 后续数据仍会写入 picked，避免“选完目录直接退出”。
+        pass
+    return picked
+
+
+configure_storage_paths(APP_DIR)
 
 # 悬浮球图标路径（打包时通过 --add-data 带上 static 目录）
 BALL_IMAGE_PATH = resource_path(os.path.join("static", "便笺.png"))
@@ -1085,6 +1249,7 @@ class StickyNote:
         self.more_menu.add_command("手动保存", lambda: self._save_notes(force=True), "Ctrl+S")
         self.more_menu.add_command("清空所有任务", self.clear_all)
         self.more_menu.add_command("打开存储目录", self.open_save_dir)
+        self.more_menu.add_command("更改存储路径…", self.change_storage_root)
         self.more_menu.add_separator()
         self.more_menu.add_command("最小化", self.minimize_window)
         self.more_menu.add_command("隐藏到托盘", self.hide_to_tray)
@@ -1985,6 +2150,9 @@ class StickyNote:
             os.startfile(NOTES_DIR)
         except Exception:
             pass
+
+    def change_storage_root(self):
+        self.app.change_storage_root(self.root)
 
     # --------------------------------------------------------
     # 窗口尺寸（预设 + 自定义）
@@ -3461,6 +3629,109 @@ class NotesApp:
         except Exception:
             pass
 
+    def _dialog_parent(self, preferred=None):
+        """选择当前可见窗口作为对话框父级，避免弹窗跑到后台。"""
+        if preferred is not None:
+            try:
+                if preferred.winfo_exists() and preferred.winfo_viewable():
+                    return preferred
+            except Exception:
+                pass
+        for n in self.notes.values():
+            try:
+                if not n._destroyed and n._visible and n.root.winfo_viewable():
+                    return n.root
+            except Exception:
+                continue
+        return self.root
+
+    def _move_storage_payload(self, old_root: str, new_root: str):
+        """把旧存储目录的数据迁移到新目录（尽量 move，失败回退 copy）。"""
+        old_root = os.path.abspath(old_root)
+        new_root = os.path.abspath(new_root)
+        os.makedirs(new_root, exist_ok=True)
+
+        old_notes = os.path.join(old_root, "notes")
+        new_notes = os.path.join(new_root, "notes")
+        if os.path.isdir(old_notes):
+            shutil.copytree(old_notes, new_notes, dirs_exist_ok=True)
+            try:
+                shutil.rmtree(old_notes)
+            except Exception:
+                pass
+
+        for name in ("app.json", "notes.md", "notes.json", "config.json"):
+            src = os.path.join(old_root, name)
+            dst = os.path.join(new_root, name)
+            if not os.path.exists(src):
+                continue
+            try:
+                shutil.copy2(src, dst)
+                os.remove(src)
+            except Exception:
+                # 至少保证新目录可用，旧文件删除失败不阻塞
+                try:
+                    shutil.copy2(src, dst)
+                except Exception:
+                    pass
+
+    def change_storage_root(self, parent=None):
+        """设置里重选存储目录，并自动迁移当前数据。"""
+        parent = self._dialog_parent(parent)
+        new_root = _pick_storage_root_dialog(
+            parent,
+            title="更改存储路径",
+            intro="请选择新的统一存储路径。\n将自动迁移便笺与配置文件，并立即生效。",
+            initial_path=STORAGE_ROOT,
+        )
+        if not new_root:
+            return
+
+        old_root = os.path.abspath(STORAGE_ROOT)
+        new_root = os.path.abspath(new_root)
+        if old_root == new_root:
+            flat_messagebox(parent, "提示", "新路径与当前路径一致，无需更改。", kind="info")
+            return
+
+        try:
+            parent.lift()
+            parent.focus_force()
+            parent.update_idletasks()
+        except Exception:
+            pass
+        ok = flat_messagebox(
+            parent,
+            "确认迁移",
+            f"将把数据从：\n{old_root}\n迁移到：\n{new_root}\n\n是否继续？",
+            kind="yesno",
+        )
+        if not ok:
+            return
+
+        for n in list(self.notes.values()):
+            try:
+                if not n._destroyed:
+                    n._save_notes(force=True)
+            except Exception:
+                pass
+
+        try:
+            self._move_storage_payload(old_root, new_root)
+        except Exception as e:
+            flat_messagebox(parent, "迁移失败", str(e), kind="info")
+            return
+        try:
+            _save_bootstrap_storage_root(new_root)
+        except Exception:
+            # 路径引导文件写失败不影响本次切换与数据迁移
+            pass
+
+        configure_storage_paths(new_root)
+        self.prefs = self._load_prefs()
+        self._rebuild_all_notes()
+        self._scan_note_ids()
+        flat_messagebox(parent, "完成", "存储路径已更新并迁移完成。", kind="info")
+
     # ------- 主题切换 -------
     def set_theme(self, name):
         """切换主题：写入偏好 + 重建所有便笺（保留文本与显隐状态）。"""
@@ -4062,6 +4333,10 @@ class NotesApp:
 
 
 def main():
+    storage_root = resolve_storage_root()
+    if not storage_root:
+        return
+    configure_storage_paths(storage_root)
     if _try_ping_existing_instance():
         sys.exit(0)
     app = NotesApp()
