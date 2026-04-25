@@ -24,7 +24,9 @@ Get-ChildItem -Filter "*.spec" | Remove-Item -Force -ErrorAction SilentlyContinu
 
 # -w 隐藏控制台；-F 单文件；--name 指定产物名
 # --add-data "static;static"：把悬浮球图标一并打包进 EXE
+# --icon：资源管理器中 EXE 图标（由 tools/render_app_icons.py 生成 static/app.ico）
 .\venv\Scripts\python.exe -m PyInstaller -w -F --name "便笺" --clean `
+    --icon "static\app.ico" `
     --hidden-import pystray._win32 `
     --hidden-import PIL._tkinter_finder `
     --add-data "static;static" `

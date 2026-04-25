@@ -234,6 +234,9 @@ APP_PREFS_PATH = os.path.join(get_data_dir(), "app.json")
 
 # 悬浮球图标路径（打包时通过 --add-data 带上 static 目录）
 BALL_IMAGE_PATH = resource_path(os.path.join("static", "便笺.png"))
+# Windows 窗口/任务栏图标路径（打包时通过 --add-data 带上 static 目录）
+APP_ICON_PATH = resource_path(os.path.join("static", "app.ico"))
+APP_USER_MODEL_ID = "bianjian.stickynote.app"
 BALL_SIZE = 40
 BALL_PEEK = 16
 BALL_AUTO_HIDE_MS = 3000
@@ -247,6 +250,11 @@ AC_SRC_OVER = 0x00
 AC_SRC_ALPHA = 0x01
 BI_RGB = 0
 DIB_RGB_COLORS = 0
+LR_LOADFROMFILE = 0x00000010
+IMAGE_ICON = 1
+WM_SETICON = 0x0080
+ICON_SMALL = 0
+ICON_BIG = 1
 
 
 class _POINT(ctypes.Structure):
@@ -822,7 +830,40 @@ class StickyNote:
             style = style | WS_EX_APPWINDOW
             self.root.withdraw()
             ctypes.windll.user32.SetWindowLongW(hwnd, GWL_EXSTYLE, style)
+            self._apply_window_icon(hwnd)
             self.root.after(10, self.root.deiconify)
+        except Exception:
+            pass
+
+    def _apply_window_icon(self, hwnd=None):
+        """设置窗口图标：优先 app.ico，并显式推送大小图标给 Win32。"""
+        if not os.path.exists(APP_ICON_PATH):
+            return
+        try:
+            self.root.iconbitmap(APP_ICON_PATH)
+        except Exception:
+            pass
+        try:
+            import ctypes
+
+            if hwnd is None:
+                hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+            if not hwnd:
+                return
+
+            # 32/48 像素分别覆盖小图标与大图标，任务栏与 Alt+Tab 显示更清晰。
+            small_icon = ctypes.windll.user32.LoadImageW(
+                None, APP_ICON_PATH, IMAGE_ICON, 32, 32, LR_LOADFROMFILE
+            )
+            big_icon = ctypes.windll.user32.LoadImageW(
+                None, APP_ICON_PATH, IMAGE_ICON, 48, 48, LR_LOADFROMFILE
+            )
+            if small_icon:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_SMALL, small_icon)
+                self._hicon_small = small_icon
+            if big_icon:
+                ctypes.windll.user32.SendMessageW(hwnd, WM_SETICON, ICON_BIG, big_icon)
+                self._hicon_big = big_icon
         except Exception:
             pass
 
@@ -3361,6 +3402,7 @@ class NotesApp:
         self.root = tk.Tk()
         self.root.title("便笺")
         self.root.withdraw()
+        self._register_app_user_model_id()
 
         self._singleton_srv = None
         self._setup_single_instance_listener()
@@ -3391,6 +3433,13 @@ class NotesApp:
         else:
             # 首次启动：新建一张空白便笺
             self.new_note()
+
+    def _register_app_user_model_id(self):
+        """固定应用 ID，避免任务栏图标分组异常或图标不刷新。"""
+        try:
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_USER_MODEL_ID)
+        except Exception:
+            pass
 
     # ------- 应用偏好 -------
     def _load_prefs(self):
@@ -3842,19 +3891,57 @@ class NotesApp:
 
     # ------- 托盘 -------
     def _make_tray_image(self):
-        size = 64
-        img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+        # 高分辨率绘制后缩回 64，圆角/斜线边缘更顺滑（托盘实际仍用 64 位图）
+        scale = 4
+        out = 64
+        hi = out * scale
+
+        def z(v):
+            return int(round(v * scale))
+
+        # 相对 64×64 中心整体放大约 10%（边线坐标同步缩放）
+        cx = cy = 32.0
+        grow = 1.06
+
+        def gx(x):
+            v = cx + (x - cx) * grow
+            return int(round(max(0.0, min(63.0, v))))
+
+        def gy(y):
+            v = cy + (y - cy) * grow
+            return int(round(max(0.0, min(63.0, v))))
+
+        lx = int(round(cx + (3 - cx) * grow))
+        ly = int(round(cy + (2 - cy) * grow))
+        rx = int(round(cx + (61 - cx) * grow))
+        ry = int(round(cy + (62 - cy) * grow))
+        lx, ly = max(0, lx), max(0, ly)
+        rx, ry = min(64, rx), min(64, ry)
+
+        img = Image.new("RGBA", (hi, hi), (0, 0, 0, 0))
         draw = ImageDraw.Draw(img)
+        paper = (248, 248, 250, 255)
+        edge = (200, 200, 208, 255)
+        r = z(max(1, int(round(10 * grow))))
+        box = [z(lx), z(ly), z(rx), z(ry)]
+        w_outline = max(1, z(1))
+        w_line = max(1, z(3))
+        w_tick = max(1, z(5))
         try:
-            draw.rounded_rectangle([4, 6, 60, 60], radius=10,
-                                   fill=(50, 50, 50, 255))
+            draw.rounded_rectangle(
+                box, radius=r, fill=paper, outline=edge, width=w_outline
+            )
         except AttributeError:
-            draw.rectangle([4, 6, 60, 60], fill=(50, 50, 50, 255))
-        draw.line([(14, 18), (50, 18)], fill=(230, 230, 230, 255), width=2)
-        draw.line([(14, 26), (40, 26)], fill=(180, 180, 180, 255), width=2)
-        draw.line([(14, 42), (26, 52)], fill=(110, 206, 110, 255), width=4)
-        draw.line([(26, 52), (50, 34)], fill=(110, 206, 110, 255), width=4)
-        return img
+            draw.rectangle(box, fill=paper, outline=edge, width=w_outline)
+        draw.line([(z(gx(8)), z(gy(11))), (z(gx(56)), z(gy(11)))], fill=(90, 90, 98, 255), width=w_line)
+        draw.line([(z(gx(8)), z(gy(20))), (z(gx(45)), z(gy(20)))], fill=(130, 130, 138, 255), width=w_line)
+        draw.line([(z(gx(24)), z(gy(40))), (z(gx(31)), z(gy(48)))], fill=(32, 150, 72, 255), width=w_tick)
+        draw.line([(z(gx(31)), z(gy(48))), (z(gx(54)), z(gy(30)))], fill=(32, 150, 72, 255), width=w_tick)
+        try:
+            resample = Image.Resampling.LANCZOS
+        except AttributeError:
+            resample = Image.LANCZOS
+        return img.resize((out, out), resample)
 
     def _setup_single_instance_listener(self):
         """绑定本机端口；第二次启动在 main() 中已 ping 退出，此处处理竞态下双启动。"""
