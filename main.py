@@ -7,6 +7,7 @@
 import os
 import re
 import sys
+import socket
 import json
 import base64
 import shutil
@@ -16,6 +17,7 @@ import ctypes
 from ctypes import wintypes
 from datetime import datetime
 import tkinter as tk
+import tkinter.font as tkfont
 from tkinter import ttk, colorchooser, filedialog, messagebox
 
 # 系统托盘（可选；未安装时自动降级为直接退出）
@@ -44,6 +46,13 @@ def resource_path(rel: str) -> str:
 # ------------------------------------------------------------
 UNCHECKED = "\u2610"  # ☐
 CHECKED = "\u2611"    # ☑
+# 任务行前缀：复选框 + 零宽词连接符 + 不换行空格（共 3 个索引单位）。
+# Text 使用 wrap=char，避免 word 在符号与正文间断行；U+2060+NBSP 进一步保证前缀成段。旧版 2 字符前缀仍兼容。
+TASK_JOINER = "\u2060"  # WORD JOINER，零宽
+TASK_GAP = "\u00a0"  # NBSP
+
+# 单实例：本机回环端口（第二次启动向该端口发 1 字节以唤醒已有实例）
+SINGLE_INSTANCE_PORT = 49673
 
 # 字体族
 FONT_FAMILY = "Microsoft YaHei UI"
@@ -657,6 +666,23 @@ def flat_messagebox(master, title, message, kind="info"):
     return result["value"]
 
 
+def _try_ping_existing_instance():
+    """若已有实例在监听 SINGLE_INSTANCE_PORT，向其发送唤醒信号。成功返回 True。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(0.5)
+    try:
+        s.connect(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        s.sendall(b"\x01")
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
 # ------------------------------------------------------------
 # 主类
 # ------------------------------------------------------------
@@ -880,7 +906,8 @@ class StickyNote:
 
         self.text = tk.Text(
             text_frame,
-            wrap="word",
+            # char：避免 word 在「☐」与正文间断行（复选框独占一行）；中文按字换行观感可接受
+            wrap="char",
             bd=0,
             relief="flat",
             font=(FONT_FAMILY, FONT_SIZE),
@@ -915,6 +942,8 @@ class StickyNote:
         self.text.tag_configure("done", overstrike=True, foreground=COLOR_MUTED)
         self.text.tag_configure("checkbox", foreground=COLOR_SUBTLE)
         self.text.tag_configure("checkbox_done", foreground=COLOR_MUTED)
+        # 任务行换行悬挂缩进（续行与「☐」后正文首字对齐）
+        self._configure_task_hang_tag()
 
         # 让选中（sel）优先级最高，覆盖 highlight / done 的背景/前景色
         # 否则高亮文字被选中时看不到选中效果
@@ -1173,16 +1202,24 @@ class StickyNote:
     # 任务 / Checkbox 交互
     # --------------------------------------------------------
     def _line_prefix_info(self, line_no: int):
-        """返回 (is_task, checked, prefix_len)。"""
+        """返回 (is_task, checked, prefix_len)。规范前缀 3 字符；旧数据可为 2 字符。"""
         line_start = f"{line_no}.0"
         line_end = f"{line_no}.end"
         content = self.text.get(line_start, line_end)
         if not content:
             return False, False, 0
-        if content.startswith(UNCHECKED + " "):
-            return True, False, 2
-        if content.startswith(CHECKED + " "):
-            return True, True, 2
+        if len(content) >= 3:
+            c0, c1, c2 = content[0], content[1], content[2]
+            if c0 == UNCHECKED and c1 == TASK_JOINER and c2 in (" ", TASK_GAP):
+                return True, False, 3
+            if c0 == CHECKED and c1 == TASK_JOINER and c2 in (" ", TASK_GAP):
+                return True, True, 3
+        if len(content) >= 2:
+            c0, c1 = content[0], content[1]
+            if c0 == UNCHECKED and c1 in (" ", TASK_GAP):
+                return True, False, 2
+            if c0 == CHECKED and c1 in (" ", TASK_GAP):
+                return True, True, 2
         return False, False, 0
 
     def _current_line_no(self) -> int:
@@ -1191,7 +1228,7 @@ class StickyNote:
     def _insert_task_at_line_start(self, line_no: int, checked=False,
                                    priority=DEFAULT_PRIORITY):
         ch = CHECKED if checked else UNCHECKED
-        prefix = f"{ch} "
+        prefix = f"{ch}{TASK_JOINER}{TASK_GAP}"
         line_start = f"{line_no}.0"
         self.text.insert(line_start, prefix)
         self.text.tag_add("checkbox_done" if checked else "checkbox",
@@ -1202,7 +1239,10 @@ class StickyNote:
         self._apply_priority(line_no, priority)
 
     def _apply_done_style(self, line_no: int, done: bool):
-        text_start = f"{line_no}.2"
+        is_task, _c, plen = self._line_prefix_info(line_no)
+        if not is_task:
+            return
+        text_start = f"{line_no}.{plen}"
         text_end = f"{line_no}.end"
         if done:
             self.text.tag_add("done", text_start, text_end)
@@ -1214,6 +1254,42 @@ class StickyNote:
         """返回包含换行符的行区间，便于整行染色。
         使用 end+1c：若是最后一行，Tk 会自动裁剪到文档末尾，不会报错。"""
         return f"{line_no}.0", f"{line_no}.end+1c"
+
+    def _configure_task_hang_tag(self):
+        """按当前 Text 字体测量「复选框+空格」宽度，配置 task_hang 的 lmargin2。"""
+        try:
+            fn = tkfont.Font(self.root, font=self.text.cget("font"))
+            w = max(
+                fn.measure(UNCHECKED + TASK_JOINER + TASK_GAP),
+                fn.measure(CHECKED + TASK_JOINER + TASK_GAP),
+                fn.measure(UNCHECKED + TASK_GAP),
+                fn.measure(CHECKED + TASK_GAP),
+                fn.measure(UNCHECKED + " "),
+                fn.measure(CHECKED + " "),
+            )
+            self.text.tag_configure("task_hang", lmargin1=0, lmargin2=w)
+        except Exception:
+            self.text.tag_configure("task_hang", lmargin1=0, lmargin2=22)
+
+    def _sync_task_hang_indents(self):
+        """为任务逻辑行挂上 task_hang（悬挂缩进），非任务行移除。"""
+        if getattr(self, "_destroyed", False):
+            return
+        try:
+            self._configure_task_hang_tag()
+        except Exception:
+            pass
+        try:
+            last_line = int(self.text.index("end-1c").split(".")[0])
+        except Exception:
+            return
+        for ln in range(1, last_line + 1):
+            start, end = self._line_range_with_newline(ln)
+            is_task, _, _ = self._line_prefix_info(ln)
+            if is_task:
+                self.text.tag_add("task_hang", start, end)
+            else:
+                self.text.tag_remove("task_hang", start, end)
 
     def _apply_priority(self, line_no: int, priority: str):
         start, end = self._line_range_with_newline(line_no)
@@ -1321,7 +1397,9 @@ class StickyNote:
         if not is_task_new:
             self._insert_task_at_line_start(new_line_no, checked=False,
                                             priority=inherited_priority)
-            self.text.mark_set("insert", f"{new_line_no}.2")
+            _t, _c, _plen = self._line_prefix_info(new_line_no)
+            self.text.mark_set("insert", f"{new_line_no}.{_plen}")
+        self._sync_task_hang_indents()
         self._schedule_save()
         return "break"
 
@@ -1344,11 +1422,18 @@ class StickyNote:
 
         if is_task:
             line_text = self.text.get(f"{line_no}.0", f"{line_no}.end")
-            empty_task_only = line_text == (CHECKED if checked else UNCHECKED) + " "
+            ch = CHECKED if checked else UNCHECKED
+            empty_task_only = line_text in (
+                ch + TASK_JOINER + TASK_GAP,
+                ch + TASK_JOINER + " ",
+                ch + TASK_GAP,
+                ch + " ",
+            )
             # 空任务行：直接删除整行（合并到上一行），不再只是卡在 prefix
             if empty_task_only:
                 if line_no > 1:
                     self.text.delete(f"{line_no - 1}.end", f"{line_no}.end")
+                    self._sync_task_hang_indents()
                     self._schedule_save()
                     return "break"
                 # 第一行空任务：保留（避免无内容），光标对齐文字起点
@@ -1563,7 +1648,9 @@ class StickyNote:
         content = self.text.get("1.0", "end-1c")
         if not content:
             self._insert_task_at_line_start(1, checked=False)
-            self.text.mark_set("insert", "1.2")
+            _t, _c, _plen = self._line_prefix_info(1)
+            self.text.mark_set("insert", f"1.{_plen}")
+            self._sync_task_hang_indents()
 
     def _normalize_checkbox_prefixes(self):
         """归一化行首复选框前缀，避免出现 '☐ ☐ ' / '☑ ☐ ' 这类重复前缀。"""
@@ -1577,30 +1664,48 @@ class StickyNote:
             content = self.text.get(line_start, line_end)
             if not content:
                 continue
-            if content.startswith(UNCHECKED + " ") or content.startswith(CHECKED + " "):
-                head = content[:2]
-                rest = content[2:]
-                # 连续剥离多余前缀，只保留首个前缀语义
-                while rest.startswith(UNCHECKED + " ") or rest.startswith(CHECKED + " "):
+            is_task, checked, plen = self._line_prefix_info(ln)
+            if not is_task:
+                continue
+            ch0 = CHECKED if checked else UNCHECKED
+            rest = content[plen:]
+            while True:
+                if (
+                    len(rest) >= 3
+                    and rest[0] in (UNCHECKED, CHECKED)
+                    and rest[1] == TASK_JOINER
+                    and rest[2] in (" ", TASK_GAP)
+                ):
+                    rest = rest[3:]
+                    continue
+                if len(rest) >= 2 and rest[0] in (UNCHECKED, CHECKED) and rest[1] in (
+                    " ",
+                    TASK_GAP,
+                ):
                     rest = rest[2:]
-                new_line = head + rest
-                if new_line != content:
-                    self.text.delete(line_start, line_end)
-                    self.text.insert(line_start, new_line)
-                    checked = (head[0] == CHECKED)
-                    self.text.tag_remove("checkbox", f"{ln}.0", f"{ln}.1")
-                    self.text.tag_remove("checkbox_done", f"{ln}.0", f"{ln}.1")
-                    self.text.tag_add("checkbox_done" if checked else "checkbox",
-                                      f"{ln}.0", f"{ln}.1")
-                    self._apply_done_style(ln, checked)
+                    continue
+                break
+            new_line = ch0 + TASK_JOINER + TASK_GAP + rest
+            if new_line != content:
+                self.text.delete(line_start, line_end)
+                self.text.insert(line_start, new_line)
+                checked = ch0 == CHECKED
+                self.text.tag_remove("checkbox", f"{ln}.0", f"{ln}.1")
+                self.text.tag_remove("checkbox_done", f"{ln}.0", f"{ln}.1")
+                self.text.tag_add("checkbox_done" if checked else "checkbox",
+                                  f"{ln}.0", f"{ln}.1")
+                self._apply_done_style(ln, checked)
+        self._sync_task_hang_indents()
 
     def new_task_top(self):
         """在开头新增一个任务。"""
-        self.text.insert("1.0", f"{UNCHECKED} \n")
+        self.text.insert("1.0", f"{UNCHECKED}{TASK_JOINER}{TASK_GAP}\n")
         self.text.tag_add("checkbox", "1.0", "1.1")
         self._apply_priority(1, DEFAULT_PRIORITY)
-        self.text.mark_set("insert", "1.2")
+        _t, _c, _pl = self._line_prefix_info(1)
+        self.text.mark_set("insert", f"1.{_pl}")
         self.text.focus_set()
+        self._sync_task_hang_indents()
         self._schedule_save()
 
     def toggle_task_lines(self):
@@ -1644,6 +1749,7 @@ class StickyNote:
             self.text.mark_set("insert", f"{start_line}.{plen}")
 
         self.text.focus_set()
+        self._sync_task_hang_indents()
         self._schedule_save()
 
     # 兼容旧别名
@@ -2156,6 +2262,13 @@ class StickyNote:
         if self.text.edit_modified():
             self.text.edit_modified(False)
             self._schedule_save()
+            try:
+                ins_line = int(self.text.index("insert").split(".")[0])
+                last_line = int(self.text.index("end-1c").split(".")[0])
+                if ins_line == last_line:
+                    self.text.see("insert")
+            except tk.TclError:
+                pass
 
     def _schedule_save(self):
         if self._saving_job:
@@ -2304,10 +2417,10 @@ class StickyNote:
             if t == "task":
                 checked = line.get("checked", False)
                 ch = CHECKED if checked else UNCHECKED
-                self.text.insert("end", f"{ch} ")
+                self.text.insert("end", f"{ch}{TASK_JOINER}{TASK_GAP}")
                 self.text.tag_add("checkbox_done" if checked else "checkbox",
                                   f"{line_no}.0", f"{line_no}.1")
-                self._insert_segments(line_no, 2, line.get("segments", []))
+                self._insert_segments(line_no, 3, line.get("segments", []))
                 if checked:
                     self._apply_done_style(line_no, True)
                 priority = line.get("priority", DEFAULT_PRIORITY)
@@ -2322,6 +2435,7 @@ class StickyNote:
                 pass
         if not lines:
             self._ensure_first_task()
+        self._sync_task_hang_indents()
 
     def _insert_segments(self, line_no, start_col, segments):
         col = start_col
@@ -2351,11 +2465,11 @@ class StickyNote:
             if m:
                 checked = m.group(1).lower() == "x"
                 ch = CHECKED if checked else UNCHECKED
-                self.text.insert("end", f"{ch} ")
+                self.text.insert("end", f"{ch}{TASK_JOINER}{TASK_GAP}")
                 self.text.tag_add("checkbox_done" if checked else "checkbox",
                                   f"{line_no}.0", f"{line_no}.1")
                 segments = self._parse_md_inline(m.group(2))
-                self._insert_segments(line_no, 2, segments)
+                self._insert_segments(line_no, 3, segments)
                 if checked:
                     self._apply_done_style(line_no, True)
                 # 从 md 加载的任务默认普通优先级
@@ -2366,6 +2480,7 @@ class StickyNote:
                 else:
                     segments = self._parse_md_inline(raw)
                     self._insert_segments(line_no, 0, segments)
+        self._sync_task_hang_indents()
 
     def _parse_md_inline(self, s: str):
         """粗略解析 markdown inline 为 segments。"""
@@ -2519,9 +2634,23 @@ class StickyNote:
             if i == 0:
                 out.append(ln)
                 continue
-            if ln.startswith(UNCHECKED + " "):
+            if (
+                len(ln) >= 3
+                and ln[0] == UNCHECKED
+                and ln[1] == TASK_JOINER
+                and ln[2] in (" ", TASK_GAP)
+            ):
+                out.append(ln[3:])
+            elif len(ln) >= 2 and ln[0] == UNCHECKED and ln[1] in (" ", TASK_GAP):
                 out.append(ln[2:])
-            elif ln.startswith(CHECKED + " "):
+            elif (
+                len(ln) >= 3
+                and ln[0] == CHECKED
+                and ln[1] == TASK_JOINER
+                and ln[2] in (" ", TASK_GAP)
+            ):
+                out.append(ln[3:])
+            elif len(ln) >= 2 and ln[0] == CHECKED and ln[1] in (" ", TASK_GAP):
                 out.append(ln[2:])
             else:
                 out.append(ln)
@@ -2592,6 +2721,7 @@ class StickyNote:
             finally:
                 self._updating_sel = False
                 self._select_all_active = False
+            self._sync_task_hang_indents()
             self._schedule_save()
             return
 
@@ -2609,6 +2739,7 @@ class StickyNote:
             self.text.mark_set("insert", insert_pos)
             self.text.tag_remove("sel", "1.0", "end")
             self._select_all_active = False
+            self._sync_task_hang_indents()
             self._schedule_save()
             return
 
@@ -2622,6 +2753,7 @@ class StickyNote:
             self._normalize_checkbox_prefixes()
             self.text.mark_set("insert", start)
             self._select_all_active = False
+            self._sync_task_hang_indents()
             self._schedule_save()
             return
 
@@ -2640,6 +2772,7 @@ class StickyNote:
         self.text.tag_remove("sel", "1.0", "end")
         self._select_all_active = False
 
+        self._sync_task_hang_indents()
         self._schedule_save()
 
     def _on_paste(self, event=None):
@@ -2652,6 +2785,7 @@ class StickyNote:
             return "break"
         if data:
             self.text.insert("insert", data)
+            self._sync_task_hang_indents()
             self._schedule_save()
         return "break"
 
@@ -3228,6 +3362,9 @@ class NotesApp:
         self.root.title("便笺")
         self.root.withdraw()
 
+        self._singleton_srv = None
+        self._setup_single_instance_listener()
+
         self.notes = {}          # note_id -> StickyNote (仅已加载的窗口)
         self._tray_icon = None
         self._floating_balls = {}  # note_id -> FloatingBall
@@ -3719,6 +3856,52 @@ class NotesApp:
         draw.line([(26, 52), (50, 34)], fill=(110, 206, 110, 255), width=4)
         return img
 
+    def _setup_single_instance_listener(self):
+        """绑定本机端口；第二次启动在 main() 中已 ping 退出，此处处理竞态下双启动。"""
+        srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            srv.bind(("127.0.0.1", SINGLE_INSTANCE_PORT))
+        except OSError:
+            try:
+                srv.close()
+            except Exception:
+                pass
+            if _try_ping_existing_instance():
+                try:
+                    self.root.destroy()
+                except Exception:
+                    pass
+                raise SystemExit(0)
+            return
+
+        srv.listen(8)
+        self._singleton_srv = srv
+        app = self
+
+        def listen_loop():
+            while getattr(app, "_singleton_srv", None) is not None:
+                try:
+                    conn, _ = srv.accept()
+                except OSError:
+                    break
+                try:
+                    conn.settimeout(2.0)
+                    conn.recv(64)
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                try:
+                    app.root.after(0, app.show_current_note)
+                except Exception:
+                    break
+
+        threading.Thread(target=listen_loop, daemon=True).start()
+
     def _setup_tray(self):
         if not _HAS_TRAY:
             return
@@ -3766,6 +3949,17 @@ class NotesApp:
             except Exception:
                 pass
             self._tray_icon = None
+        srv = getattr(self, "_singleton_srv", None)
+        if srv is not None:
+            self._singleton_srv = None
+            try:
+                srv.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                srv.close()
+            except OSError:
+                pass
         for n in list(self.notes.values()):
             try:
                 n.destroy()
@@ -3781,6 +3975,8 @@ class NotesApp:
 
 
 def main():
+    if _try_ping_existing_instance():
+        sys.exit(0)
     app = NotesApp()
     app.run()
 
